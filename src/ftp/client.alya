@@ -86,7 +86,20 @@ end
 # ───────────────────────────────────────────────────────────────
 
 ## Downloads a file from an FTP server with optional offset restart for resume.
-pub function ftp_download_file(host: string, port: int, user: string, pass: string, remote_path: string, local_path: string, resume: int = 0, on_progress = null) -> TransferResult
+##
+## `rate_limit_bps` caps throughput in bytes/second (0 = unlimited) and is
+## enforced on the data socket via the shared token-bucket throttle.
+## `chunk_size` sets the data-socket read size (<= 0 falls back to 65536).
+pub function ftp_download_file(host: string, port: int, user: string, pass: string, remote_path: string, local_path: string, resume: int = 0, on_progress = null, rate_limit_bps: int = 0, chunk_size: int = 65536) -> TransferResult
+    let op_start_ms: int = clock_ms()
+    let limit: int = rate_limit_bps
+    if limit < 0
+        limit = 0
+    end
+    let read_size: int = chunk_size
+    if read_size <= 0
+        read_size = 65536
+    end
     let ctrl_sock: int = -1
     try
         ctrl_sock = net::tcp_connect(host, port)
@@ -173,13 +186,14 @@ pub function ftp_download_file(host: string, port: int, user: string, pass: stri
     end
 
     # Receive data stream from data socket
-    let tracker = progress_tracker_new(remote_size, 0)
+    let tracker = progress_tracker_new(remote_size, clock_ms())
     tracker.bytes_transferred = offset
+    let throttle = throttle_new(limit, clock_ms())
     let transferred: int = offset
 
     let receiving: int = 1
     while receiving == 1
-        let chunk: string = net::tcp_recv(data_sock, 65536)
+        let chunk: string = net::tcp_recv(data_sock, read_size)
         let clen: int = len(chunk)
         if clen == 0
             receiving = 0
@@ -190,9 +204,11 @@ pub function ftp_download_file(host: string, port: int, user: string, pass: stri
         transferred += clen
 
         if on_progress is not null
-            let prog = progress_update(tracker, transferred, 0)
+            let prog = progress_update(tracker, transferred, clock_ms())
             on_progress(prog)
         end
+
+        throttle_wait(throttle, clen)
     end
 
     net::tcp_close(data_sock)
@@ -205,10 +221,10 @@ pub function ftp_download_file(host: string, port: int, user: string, pass: stri
     net::tcp_close(ctrl_sock)
 
     if done_resp.code != 226 and done_resp.code != 250
-        return error_result(local_path, "FTP transfer incomplete: " + done_resp.message, transferred)
+        return error_result(local_path, "FTP transfer incomplete: " + done_resp.message, transferred, clock_ms() - op_start_ms)
     end
 
-    return ok_result(local_path, transferred, remote_size)
+    return ok_result(local_path, transferred, remote_size, "", clock_ms() - op_start_ms)
 end
 
 # ───────────────────────────────────────────────────────────────
@@ -216,9 +232,18 @@ end
 # ───────────────────────────────────────────────────────────────
 
 ## Uploads a file to an FTP server with optional append mode for resume.
-pub function ftp_upload_file(host: string, port: int, user: string, pass: string, local_path: string, remote_path: string, resume: int = 0, on_progress = null) -> TransferResult
+##
+## `rate_limit_bps` caps throughput in bytes/second (0 = unlimited) and is
+## enforced while streaming to the data socket. `chunk_size` sets the send
+## slice size (<= 0 falls back to 65536).
+pub function ftp_upload_file(host: string, port: int, user: string, pass: string, local_path: string, remote_path: string, resume: int = 0, on_progress = null, rate_limit_bps: int = 0, chunk_size: int = 65536) -> TransferResult
     if file_exists(local_path) == false
         return error_result(local_path, "Local file not found: " + local_path)
+    end
+    let op_start_ms: int = clock_ms()
+    let limit: int = rate_limit_bps
+    if limit < 0
+        limit = 0
     end
 
     let file_bytes: int = file_size(local_path)
@@ -271,12 +296,16 @@ pub function ftp_upload_file(host: string, port: int, user: string, pass: string
     end
 
     # Stream content to data socket
-    let tracker = progress_tracker_new(file_bytes, 0)
+    let tracker = progress_tracker_new(file_bytes, clock_ms())
+    let throttle = throttle_new(limit, clock_ms())
+    let send_size: int = chunk_size
+    if send_size <= 0
+        send_size = 65536
+    end
     let sent: int = 0
-    let chunk_size: int = 65536
 
     while sent < file_bytes
-        let end_idx: int = sent + chunk_size
+        let end_idx: int = sent + send_size
         if end_idx > file_bytes
             end_idx = file_bytes
         end
@@ -285,9 +314,11 @@ pub function ftp_upload_file(host: string, port: int, user: string, pass: string
         sent = end_idx
 
         if on_progress is not null
-            let prog = progress_update(tracker, sent, 0)
+            let prog = progress_update(tracker, sent, clock_ms())
             on_progress(prog)
         end
+
+        throttle_wait(throttle, len(chunk))
     end
 
     net::tcp_close(data_sock)
@@ -299,8 +330,8 @@ pub function ftp_upload_file(host: string, port: int, user: string, pass: string
     net::tcp_close(ctrl_sock)
 
     if done_resp.code != 226 and done_resp.code != 250
-        return error_result(local_path, "FTP upload incomplete: " + done_resp.message, sent)
+        return error_result(local_path, "FTP upload incomplete: " + done_resp.message, sent, clock_ms() - op_start_ms)
     end
 
-    return ok_result(local_path, sent, file_bytes)
+    return ok_result(local_path, sent, file_bytes, "", clock_ms() - op_start_ms)
 end

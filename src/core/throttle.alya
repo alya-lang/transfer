@@ -13,21 +13,43 @@ end
 
 ## Creates a new `Throttle` instance with given bytes-per-second limit (0 = unlimited).
 pub function throttle_new(rate_limit_bps: int = 0, current_time_ms: int = 0) -> Throttle
+    let limit: int = rate_limit_bps
+    if limit < 0
+        limit = 0
+    end
     return Throttle {
-        rate_limit_bps: rate_limit_bps,
+        rate_limit_bps: limit,
         bytes_in_window: 0,
         window_start_ms: current_time_ms
     }
 end
 
 ## Evaluates whether bandwidth cap is exceeded and returns required sleep delay in ms.
+##
+## Pure computation only: it accounts `chunk_size` into the current 1-second
+## window and returns how long the caller must wait, but never sleeps itself.
+## Production transfer loops must use `throttle_wait` below so the delay is
+## actually enforced via `sleep`.
 pub function throttle_delay_ms(throttle: Throttle, chunk_size: int, current_time_ms: int) -> int
+    if throttle is null
+        return 0
+    end
     if throttle.rate_limit_bps <= 0
         return 0
     end
+    if chunk_size <= 0
+        return 0
+    end
 
-    throttle.bytes_in_window += chunk_size
     let elapsed: int = current_time_ms - throttle.window_start_ms
+
+    if elapsed < 0
+        # Clock moved backwards (or stale anchor in the future): re-anchor
+        # instead of computing a bogus huge delay from a negative elapsed.
+        throttle.bytes_in_window = chunk_size
+        throttle.window_start_ms = current_time_ms
+        return 0
+    end
 
     if elapsed >= 1000
         # Reset window after 1 second
@@ -37,12 +59,61 @@ pub function throttle_delay_ms(throttle: Throttle, chunk_size: int, current_time
     end
 
     # If bytes in current window exceed rate limit, calculate needed delay
+    throttle.bytes_in_window += chunk_size
     if throttle.bytes_in_window > throttle.rate_limit_bps
         let expected_ms: int = (throttle.bytes_in_window * 1000) / throttle.rate_limit_bps
         let delay_needed: int = expected_ms - elapsed
         if delay_needed > 0
             return delay_needed
         end
+    end
+    return 0
+end
+
+## Returns 1 when throttling is active (positive rate limit), else 0.
+pub function throttle_is_limited(throttle: Throttle) -> int
+    if throttle is null
+        return 0
+    end
+    if throttle.rate_limit_bps <= 0
+        return 0
+    end
+    return 1
+end
+
+## Resets the accounting window to `current_time_ms`.
+pub function throttle_reset(throttle: Throttle, current_time_ms: int)
+    if throttle is not null
+        throttle.bytes_in_window = 0
+        throttle.window_start_ms = current_time_ms
+    end
+end
+
+## Accounts `chunk_size` and sleeps when the rate cap is exceeded.
+##
+## Production entry point: reads `clock_ms()`, delegates to
+## `throttle_delay_ms`, sleeps the computed delay, then re-anchors the
+## window so the next chunk starts clean. Returns the slept milliseconds
+## (0 when unlimited or within budget). A non-positive `chunk_size` is a
+## no-op.
+pub function throttle_wait(throttle: Throttle, chunk_size: int) -> int
+    if throttle is null
+        return 0
+    end
+    if throttle.rate_limit_bps <= 0
+        return 0
+    end
+    if chunk_size <= 0
+        return 0
+    end
+    let now: int = clock_ms()
+    let delay: int = throttle_delay_ms(throttle, chunk_size, now)
+    if delay > 0
+        sleep(delay)
+        # Re-anchor after sleeping so the next chunk starts a fresh window.
+        throttle.bytes_in_window = 0
+        throttle.window_start_ms = clock_ms()
+        return delay
     end
     return 0
 end

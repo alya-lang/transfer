@@ -58,7 +58,11 @@ end
 
 ## Sets the bandwidth throttle rate limit in bytes per second (0 = unlimited).
 pub function TransferBuilder.rate_limit(self: TransferBuilder, bps: int) -> TransferBuilder
-    self.config.rate_limit_bps = bps
+    if bps < 0
+        self.config.rate_limit_bps = 0
+    else
+        self.config.rate_limit_bps = bps
+    end
     return self
 end
 
@@ -139,9 +143,9 @@ pub function TransferBuilder.execute(self: TransferBuilder) -> TransferResult
         end
 
         if self.mode == TransferMode.Download
-            return ftp_download_file(host, port, user, pass, parsed["path"], self.file_path, self.config.resumable, self.progress_callback)
+            return ftp_download_file(host, port, user, pass, parsed["path"], self.file_path, self.config.resumable, self.progress_callback, self.config.rate_limit_bps, self.config.chunk_size)
         else
-            return ftp_upload_file(host, port, user, pass, self.file_path, parsed["path"], self.config.resumable, self.progress_callback)
+            return ftp_upload_file(host, port, user, pass, self.file_path, parsed["path"], self.config.resumable, self.progress_callback, self.config.rate_limit_bps, self.config.chunk_size)
         end
     end
 

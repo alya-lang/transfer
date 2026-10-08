@@ -105,6 +105,7 @@ pub function http_transfer_download(url_str: string, dest_path: string, config: 
     if cfg is null
         cfg = make_config()
     end
+    let op_start_ms: int = clock_ms()
 
     let parsed = parse_transfer_url(url_str)
     let host: string = parsed["host"]
@@ -211,9 +212,10 @@ pub function http_transfer_download(url_str: string, dest_path: string, config: 
     save_resume_meta(meta)
 
     # Initialize progress tracker and throttle
-    let tracker = progress_tracker_new(total_bytes, 0)
+    let now_ms: int = clock_ms()
+    let tracker = progress_tracker_new(total_bytes, now_ms)
     tracker.bytes_transferred = start_offset
-    let throttle = throttle_new(cfg.rate_limit_bps, 0)
+    let throttle = throttle_new(cfg.rate_limit_bps, now_ms)
 
     # Write initial body remainder if any
     let transferred: int = start_offset
@@ -224,6 +226,12 @@ pub function http_transfer_download(url_str: string, dest_path: string, config: 
             write_file(dest_path, body_remainder)
         end
         transferred += len(body_remainder)
+        # Account remainder against the rate cap so the first burst is paced too.
+        throttle_wait(throttle, len(body_remainder))
+        if on_progress is not null
+            let init_prog = progress_update(tracker, transferred, clock_ms())
+            on_progress(init_prog)
+        end
     end
 
     # Stream remaining data chunks from socket
@@ -250,15 +258,12 @@ pub function http_transfer_download(url_str: string, dest_path: string, config: 
 
         # Dispatch live progress callback
         if on_progress is not null
-            let prog = progress_update(tracker, transferred, 0)
+            let prog = progress_update(tracker, transferred, clock_ms())
             on_progress(prog)
         end
 
-        # Apply rate limiting throttle if configured
-        let delay: int = throttle_delay_ms(throttle, clen, 0)
-        if delay > 0
-            throttle.bytes_in_window = 0
-        end
+        # Apply rate limiting throttle if configured (sleeps when over budget)
+        throttle_wait(throttle, clen)
 
         if total_bytes > 0 and transferred >= total_bytes
             active = 0
@@ -274,7 +279,7 @@ pub function http_transfer_download(url_str: string, dest_path: string, config: 
         actual_checksum = compute_file_checksum(dest_path, cfg.checksum_algo)
         if cfg.expected_checksum != ""
             if lower(actual_checksum) != lower(cfg.expected_checksum)
-                return error_result(dest_path, "Checksum mismatch: expected " + cfg.expected_checksum + ", got " + actual_checksum, transferred)
+                return error_result(dest_path, "Checksum mismatch: expected " + cfg.expected_checksum + ", got " + actual_checksum, transferred, clock_ms() - op_start_ms)
             end
         end
     end
@@ -282,7 +287,7 @@ pub function http_transfer_download(url_str: string, dest_path: string, config: 
     # Clean up resume token on completion
     clear_resume_meta(dest_path)
 
-    return ok_result(dest_path, transferred, total_bytes, actual_checksum)
+    return ok_result(dest_path, transferred, total_bytes, actual_checksum, clock_ms() - op_start_ms)
 end
 
 # ───────────────────────────────────────────────────────────────
@@ -299,6 +304,7 @@ pub function http_transfer_upload(url_str: string, src_path: string, config: Tra
     if cfg is null
         cfg = make_config()
     end
+    let op_start_ms: int = clock_ms()
 
     let file_bytes: int = file_size(src_path)
     let content: string = read_file(src_path)
@@ -342,8 +348,8 @@ pub function http_transfer_upload(url_str: string, src_path: string, config: Tra
     net::tcp_send(sock, header_wire)
 
     # Stream file content in chunks
-    let tracker = progress_tracker_new(file_bytes, 0)
-    let throttle = throttle_new(cfg.rate_limit_bps, 0)
+    let tracker = progress_tracker_new(file_bytes, clock_ms())
+    let throttle = throttle_new(cfg.rate_limit_bps, clock_ms())
     let chunk_size: int = cfg.chunk_size
     if chunk_size <= 0
         chunk_size = 65536
@@ -360,14 +366,11 @@ pub function http_transfer_upload(url_str: string, src_path: string, config: Tra
         sent = end_idx
 
         if on_progress is not null
-            let prog = progress_update(tracker, sent, 0)
+            let prog = progress_update(tracker, sent, clock_ms())
             on_progress(prog)
         end
 
-        let delay: int = throttle_delay_ms(throttle, len(chunk), 0)
-        if delay > 0
-            throttle.bytes_in_window = 0
-        end
+        throttle_wait(throttle, len(chunk))
     end
 
     # Read server reply
@@ -377,8 +380,8 @@ pub function http_transfer_upload(url_str: string, src_path: string, config: Tra
     let parsed_resp = parse_http_header_block(resp_wire)
     let code: int = parsed_resp["status_code"]
     if code < 200 or code >= 300
-        return error_result(src_path, "HTTP upload failed with status " + str(code), sent)
+        return error_result(src_path, "HTTP upload failed with status " + str(code), sent, clock_ms() - op_start_ms)
     end
 
-    return ok_result(src_path, sent, file_bytes)
+    return ok_result(src_path, sent, file_bytes, "", clock_ms() - op_start_ms)
 end

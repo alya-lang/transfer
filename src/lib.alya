@@ -62,13 +62,13 @@ pub function upload_file(url: string, src_path: string, config: TransferConfig =
 end
 
 ## Performs an FTP file download with optional offset restart (REST) for resume.
-pub function ftp_download(host: string, port: int, user: string, pass: string, remote_path: string, local_path: string, resume: int = 1, on_progress = null) -> TransferResult
-    return ftp_download_file(host, port, user, pass, remote_path, local_path, resume, on_progress)
+pub function ftp_download(host: string, port: int, user: string, pass: string, remote_path: string, local_path: string, resume: int = 1, on_progress = null, rate_limit_bps: int = 0, chunk_size: int = 65536) -> TransferResult
+    return ftp_download_file(host, port, user, pass, remote_path, local_path, resume, on_progress, rate_limit_bps, chunk_size)
 end
 
 ## Performs an FTP file upload with optional append mode (APPE) for resume.
-pub function ftp_upload(host: string, port: int, user: string, pass: string, local_path: string, remote_path: string, resume: int = 0, on_progress = null) -> TransferResult
-    return ftp_upload_file(host, port, user, pass, local_path, remote_path, resume, on_progress)
+pub function ftp_upload(host: string, port: int, user: string, pass: string, local_path: string, remote_path: string, resume: int = 0, on_progress = null, rate_limit_bps: int = 0, chunk_size: int = 65536) -> TransferResult
+    return ftp_upload_file(host, port, user, pass, local_path, remote_path, resume, on_progress, rate_limit_bps, chunk_size)
 end
 
 # ───────────────────────────────────────────────────────────────

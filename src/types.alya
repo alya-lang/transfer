@@ -141,12 +141,16 @@ end
 
 ## Creates a new default `TransferConfig` instance.
 pub function make_config(timeout_ms: int = 15000, chunk_size: int = 65536, max_retries: int = 3, retry_delay_ms: int = 1000, rate_limit_bps: int = 0, resumable: int = 1, overwrite: int = 0) -> TransferConfig
+    let limit: int = rate_limit_bps
+    if limit < 0
+        limit = 0
+    end
     return TransferConfig {
         timeout_ms: timeout_ms,
         chunk_size: chunk_size,
         max_retries: max_retries,
         retry_delay_ms: retry_delay_ms,
-        rate_limit_bps: rate_limit_bps,
+        rate_limit_bps: limit,
         resumable: resumable,
         overwrite: overwrite,
         checksum_algo: ChecksumAlgo.None,
@@ -244,7 +248,20 @@ pub function TransferConfig.is_valid(self: TransferConfig) -> int
     if self.timeout_ms <= 0 or self.chunk_size <= 0
         return 0
     end
+    if self.rate_limit_bps < 0
+        return 0
+    end
     return 1
+end
+
+## Sets the bandwidth throttle rate limit in bytes per second (0 = unlimited).
+pub function TransferConfig.set_rate_limit(self: TransferConfig, bps: int) -> TransferConfig
+    if bps < 0
+        self.rate_limit_bps = 0
+    else
+        self.rate_limit_bps = bps
+    end
+    return self
 end
 
 ## Sets a custom HTTP request header on this configuration.
