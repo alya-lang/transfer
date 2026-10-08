@@ -21,7 +21,7 @@ end
 
 ## Formats duration in seconds into HH:MM:SS or MM:SS.
 pub function format_time(seconds: int) -> string
-    return format_duration(seconds)
+    return format_transfer_duration(seconds)
 end
 
 ## Formats a `TransferProgress` snapshot into a full visual summary line.

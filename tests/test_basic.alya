@@ -2,7 +2,107 @@
 ## Part of the Alya Language package ecosystem (https://github.com/alya-lang)
 
 import "std/test"
+import "std/net" as net
 import "../src/lib.alya" as pkg
+
+# ───────────────────────────────────────────────────────────
+# SFTP loopback fake server (in-memory transport, no sockets)
+# ───────────────────────────────────────────────────────────
+
+let t_reqs = []
+let t_resps = []
+let t_cursor = { "req": 0, "resp": 0 }
+let t_files = {}
+let t_handles = {}
+let t_hseq = { "n": 1 }
+
+function t_fake_send(pkt)
+    t_reqs.push(pkt)
+end
+
+function t_u64(arr, off) -> int
+    let v: int = 0
+    let i: int = 0
+    while i < 8
+        v = v * 256 + arr[off + i]
+        i += 1
+    end
+    return v
+end
+
+function t_fake_step()
+    while t_cursor["req"] < len(t_reqs)
+        let req = t_reqs[t_cursor["req"]]
+        t_cursor["req"] = t_cursor["req"] + 1
+        let ptype: int = req.packet_type
+        let rid: int = req.request_id
+        let wire = req.payload_bytes
+        when ptype
+            is 1
+                t_resps.push(pkg::sftp_build_version(3))
+            is 3
+                let pd = pkg::decode_sftp_string_bytes(wire, 9)
+                let path: string = pd["value"]
+                let flags: int = pkg::decode_u32_bytes(wire, pd["next_offset"])
+                if flags == 1 and t_files.has(path) == false
+                    t_resps.push(pkg::sftp_build_status(rid, 2, "no such file"))
+                else
+                    if t_files.has(path) == false
+                        t_files[path] = ""
+                    end
+                    if flags != 1
+                        t_files[path] = ""
+                    end
+                    let h: string = "h" + str(t_hseq["n"])
+                    t_hseq["n"] = t_hseq["n"] + 1
+                    t_handles[h] = path
+                    t_resps.push(pkg::sftp_build_handle(rid, h))
+                end
+            is 5
+                let hd = pkg::decode_sftp_string_bytes(wire, 9)
+                let off: int = t_u64(wire, hd["next_offset"])
+                let ln: int = pkg::decode_u32_bytes(wire, hd["next_offset"] + 8)
+                let path: string = t_handles[hd["value"]]
+                let content: string = t_files[path]
+                if off >= len(content)
+                    t_resps.push(pkg::sftp_build_status(rid, 1, "EOF"))
+                else
+                    let end_idx: int = off + ln
+                    if end_idx > len(content)
+                        end_idx = len(content)
+                    end
+                    t_resps.push(pkg::sftp_build_data(rid, slice(content, off, end_idx)))
+                end
+            is 6
+                let hd = pkg::decode_sftp_string_bytes(wire, 9)
+                let off: int = t_u64(wire, hd["next_offset"])
+                let dd = pkg::decode_sftp_string_bytes(wire, hd["next_offset"] + 8)
+                let path: string = t_handles[hd["value"]]
+                let content: string = t_files[path]
+                let before: string = slice(content, 0, off)
+                let after: string = ""
+                if off + len(dd["value"]) < len(content)
+                    after = slice(content, off + len(dd["value"]), len(content))
+                end
+                t_files[path] = before + dd["value"] + after
+                t_resps.push(pkg::sftp_build_status(rid, 0, ""))
+            is 4
+                t_resps.push(pkg::sftp_build_status(rid, 0, ""))
+            else
+                t_resps.push(pkg::sftp_build_status(rid, 8, "unsupported"))
+        end
+    end
+end
+
+function t_fake_recv()
+    t_fake_step()
+    if t_cursor["resp"] >= len(t_resps)
+        return null
+    end
+    let p = t_resps[t_cursor["resp"]]
+    t_cursor["resp"] = t_cursor["resp"] + 1
+    return p
+end
 
 function main()
     test_suite("transfer Test Suite")
@@ -280,6 +380,178 @@ function main()
 
     let banner = pkg::format_transfer_banner("Download Task Started")
     runner_assert_eq(r, len(banner) > 0, true, "format_transfer_banner is non-empty")
+
+    # ═══════════════════════════════════════════════════════════
+    # 13. Redirect Resolution & Policy
+    # ═══════════════════════════════════════════════════════════
+    runner_assert_str_eq(r, pkg::resolve_redirect_url("http://a.com/o", "https://b.com/n"), "https://b.com/n", "absolute location passes through")
+    runner_assert_str_eq(r, pkg::resolve_redirect_url("http://a.com:8080/d", "//other.com/x"), "http://other.com/x", "scheme-relative location")
+    runner_assert_str_eq(r, pkg::resolve_redirect_url("https://a.com:8443/a/b", "/root"), "https://a.com:8443/root", "root-relative keeps non-default port")
+    runner_assert_str_eq(r, pkg::resolve_redirect_url("http://h:80/a", "/b"), "http://h/b", "default port elided")
+    runner_assert_str_eq(r, pkg::resolve_redirect_url("http://h/dir/page", "sub"), "http://h/dir/sub", "relative location merges")
+    runner_assert_str_eq(r, pkg::resolve_redirect_url("http://h/dir/", ""), "", "empty location resolves to empty")
+    runner_assert_eq(r, pkg::redirect_crosses_host("http://a.com/x", "http://a.com/y"), 0, "same host is not cross-host")
+    runner_assert_eq(r, pkg::redirect_crosses_host("http://a.com/x", "http://b.com/y"), 1, "other host is cross-host")
+    runner_assert_eq(r, pkg::http_is_redirect(301), 1, "301 is redirect")
+    runner_assert_eq(r, pkg::http_is_redirect(308), 1, "308 is redirect")
+    runner_assert_eq(r, pkg::http_is_redirect(200), 0, "200 is not redirect")
+    runner_assert_eq(r, pkg::http_is_redirect(404), 0, "404 is not redirect")
+
+    # ═══════════════════════════════════════════════════════════
+    # 14. Retry Policy & Query Targets
+    # ═══════════════════════════════════════════════════════════
+    runner_assert_eq(r, pkg::retry_max_attempts(null), 1, "null config means 1 attempt")
+    let rcfg = pkg::new_config(10000, 1024, 3, 0, 1)
+    runner_assert_eq(r, pkg::retry_max_attempts(rcfg), 4, "max_retries 3 means 4 attempts")
+    runner_assert_eq(r, pkg::retry_backoff_ms(rcfg, 2), 2000, "linear backoff delay*attempt")
+    runner_assert_eq(r, pkg::retry_backoff_ms(null, 1), 0, "null config means no backoff")
+    runner_assert_eq(r, pkg::http_retryable_error("Connection failed to h:80"), 1, "connect failure is retryable")
+    runner_assert_eq(r, pkg::http_retryable_error("HTTP error 503 busy"), 1, "HTTP 5xx is retryable")
+    runner_assert_eq(r, pkg::http_retryable_error("HTTP error 404 missing"), 0, "HTTP 4xx is fatal")
+    runner_assert_eq(r, pkg::http_retryable_error("Checksum mismatch: x"), 0, "checksum mismatch is fatal")
+    runner_assert_eq(r, pkg::http_retryable_error("Too many redirects"), 0, "redirect overflow is fatal")
+    runner_assert_eq(r, pkg::ftp_retryable_error("FTP control connection failed to h:21"), 1, "ftp connect failure is retryable")
+    runner_assert_eq(r, pkg::ftp_retryable_error("FTP RETR failed [421]: busy"), 1, "ftp 4xx is retryable")
+    runner_assert_eq(r, pkg::ftp_retryable_error("FTP RETR failed [550]: missing"), 0, "ftp 5xx is fatal")
+    runner_assert_eq(r, pkg::ftp_retryable_error("FTP login failed [530]: denied"), 0, "ftp login failure is fatal")
+    let qparsed = pkg::parse_transfer_url("http://h:8080/a?token=123")
+    runner_assert_str_eq(r, pkg::http_request_target(qparsed), "/a?token=123", "query string preserved in target")
+    let nqparsed = pkg::parse_transfer_url("http://h/a")
+    runner_assert_str_eq(r, pkg::http_request_target(nqparsed), "/a", "no query means plain path")
+
+    # Offline failure paths (fast refused localhost, no retry)
+    let fast_cfg = pkg::new_config(3000, 1024, 0, 0, 1)
+    let http_fail = pkg::http_download_once("http://127.0.0.1:1/x", "temp_http_fail.bin", fast_cfg, null)
+    runner_assert_eq(r, http_fail.is_error(), 1, "refused http download is error")
+    let up_missing = pkg::http_upload_once("http://127.0.0.1:1/x", "temp_no_such_file.bin", fast_cfg, null)
+    runner_assert_eq(r, up_missing.is_error(), 1, "missing upload source is error")
+    let ftp_fail = pkg::ftp_download_once("127.0.0.1", 1, "u", "p", "/x", "temp_ftp_fail.bin", fast_cfg, null)
+    runner_assert_eq(r, ftp_fail.is_error(), 1, "refused ftp download is error")
+
+    # ═══════════════════════════════════════════════════════════
+    # 15. FTP Active Mode & Loopback Sockets
+    # ═══════════════════════════════════════════════════════════
+    runner_assert_str_eq(r, pkg::ftp_format_port("192.168.1.50", 50069), "192,168,1,50,195,149", "PORT coordinates")
+    runner_assert_str_eq(r, pkg::ftp_format_port("not-an-ip", 21), "", "bad ip gives empty PORT")
+    runner_assert_str_eq(r, pkg::ftp_format_port("10.0.0.1", 0), "", "bad port gives empty PORT")
+
+    let loop_port: int = 39441
+    let loop_ls: int = -1
+    while loop_port < 39444
+        loop_ls = net::tcp_listen(loop_port)
+        if loop_ls >= 0
+            break
+        end
+        loop_port += 1
+    end
+    if loop_ls >= 0
+        let loop_cli: int = net::tcp_connect("127.0.0.1", loop_port)
+        runner_assert_eq(r, loop_cli >= 0, true, "loopback connect succeeds")
+        let loop_srv: int = net::tcp_accept(loop_ls)
+        runner_assert_eq(r, loop_srv >= 0, true, "loopback accept succeeds")
+        net::tcp_send(loop_cli, "ping")
+        runner_assert_str_eq(r, net::tcp_recv(loop_srv, 4), "ping", "loopback cli->srv works")
+        net::tcp_send(loop_srv, "pong")
+        runner_assert_str_eq(r, net::tcp_recv(loop_cli, 4), "pong", "loopback srv->cli works")
+        net::tcp_close(loop_cli)
+        net::tcp_close(loop_srv)
+        net::tcp_close(loop_ls)
+    end
+
+    # ═══════════════════════════════════════════════════════════
+    # 16. SFTP Response Codes, Builders & Parsing
+    # ═══════════════════════════════════════════════════════════
+    runner_assert_eq(r, pkg::SftpType.Status, 101, "SftpType.Status is 101")
+    runner_assert_eq(r, pkg::SftpType.Handle, 102, "SftpType.Handle is 102")
+    runner_assert_eq(r, pkg::SftpType.Data, 103, "SftpType.Data is 103")
+    runner_assert_eq(r, pkg::SftpStatus.Ok, 0, "SftpStatus.Ok is 0")
+    runner_assert_eq(r, pkg::SftpStatus.Eof, 1, "SftpStatus.Eof is 1")
+
+    let ver_pkt = pkg::sftp_build_version(3)
+    runner_assert_eq(r, pkg::sftp_parse_version(ver_pkt), 3, "version packet parses to 3")
+    runner_assert_eq(r, pkg::sftp_parse_version(sftp_init), -1, "INIT packet is not a version")
+
+    let h_pkt = pkg::sftp_build_handle(7, "handle-9")
+    runner_assert_eq(r, h_pkt.packet_type, pkg::SftpType.Handle, "handle packet type")
+    runner_assert_str_eq(r, pkg::sftp_parse_handle(h_pkt), "handle-9", "handle roundtrip")
+
+    let d_pkt = pkg::sftp_build_data(8, "payload-bytes")
+    runner_assert_eq(r, d_pkt.packet_type, pkg::SftpType.Data, "data packet type")
+    runner_assert_str_eq(r, pkg::sftp_parse_data(d_pkt), "payload-bytes", "data roundtrip")
+
+    let st_pkt = pkg::sftp_build_status(9, 2, "no such file")
+    let st_parsed = pkg::sftp_parse_status(st_pkt)
+    runner_assert_eq(r, st_parsed["code"], 2, "status code roundtrip")
+    runner_assert_str_eq(r, st_parsed["message"], "no such file", "status message roundtrip")
+
+    # ═══════════════════════════════════════════════════════════
+    # 17. SFTP Loopback Download / Upload / Resume
+    # ═══════════════════════════════════════════════════════════
+    t_files["/remote/data.bin"] = "Hello SFTP loopback world! 0123456789"
+    let sftp_cfg = pkg::new_config(5000, 8, 0, 0, 1)
+
+    let dl_file = "temp_sftp_dl.bin"
+    let dl_res = pkg::sftp_download_file(t_fake_send, t_fake_recv, "/remote/data.bin", dl_file, sftp_cfg, null)
+    runner_assert_eq(r, dl_res.is_ok(), 1, "sftp loopback download ok")
+    runner_assert_str_eq(r, read_file(dl_file), t_files["/remote/data.bin"], "sftp download content matches")
+
+    # Resume: truncate local to a prefix, download again, expect full file.
+    write_file(dl_file, "Hello SFTP")
+    let re_res = pkg::sftp_download_file(t_fake_send, t_fake_recv, "/remote/data.bin", dl_file, sftp_cfg, null)
+    runner_assert_eq(r, re_res.is_ok(), 1, "sftp resume download ok")
+    runner_assert_str_eq(r, read_file(dl_file), t_files["/remote/data.bin"], "sftp resumed content matches")
+    remove_file(dl_file)
+
+    let up_src = "temp_sftp_up_src.bin"
+    write_file(up_src, "upload payload 12345")
+    let up_res = pkg::sftp_upload_file(t_fake_send, t_fake_recv, up_src, "/remote/up.bin", sftp_cfg, null)
+    runner_assert_eq(r, up_res.is_ok(), 1, "sftp loopback upload ok")
+    runner_assert_str_eq(r, t_files["/remote/up.bin"], "upload payload 12345", "sftp uploaded content matches")
+    remove_file(up_src)
+
+    let miss_res = pkg::sftp_download_file(t_fake_send, t_fake_recv, "/remote/missing.bin", "temp_sftp_miss.bin", sftp_cfg, null)
+    runner_assert_eq(r, miss_res.is_error(), 1, "sftp missing file is error")
+    runner_assert_eq(r, miss_res.bytes_transferred, 0, "sftp missing file transfers 0")
+
+    # ═══════════════════════════════════════════════════════════
+    # 18. Secure-Gated Error Paths (offline-safe in every config)
+    # ═══════════════════════════════════════════════════════════
+    let https_fail = pkg::https_download_once("https://127.0.0.1:1/x", "temp_https_fail.bin", fast_cfg, null)
+    runner_assert_eq(r, https_fail.is_error(), 1, "https without peer is error")
+    let ftps_fail = pkg::ftps_download_file("127.0.0.1", 1, "u", "p", "/x", "temp_ftps_fail.bin", fast_cfg, null)
+    runner_assert_eq(r, ftps_fail.is_error(), 1, "ftps without peer is error")
+    let sftp_url_res = pkg::download("sftp://h/x", "temp_sftp_url.bin").execute()
+    runner_assert_eq(r, sftp_url_res.is_error(), 1, "sftp:// builder needs a transport")
+
+    # FTPS active-mode guard (secure builds run the real function here).
+    let act_cfg = pkg::new_config(3000, 1024, 0, 0, 1)
+    act_cfg.set_ftp_active("10.0.0.5", 40021)
+    @cfg(feature = "secure")
+    runner_assert_str_eq(r, pkg::ftps_download_once("127.0.0.1", 1, "u", "p", "/x", "temp_ftps_act.bin", act_cfg, null).error_message, "FTPS active mode is not supported (use passive PASV)", "ftps active guard")
+
+    # ═══════════════════════════════════════════════════════════
+    # 19. Extended Config & Builder Surface
+    # ═══════════════════════════════════════════════════════════
+    let cfg2 = pkg::new_config(10000, 1024, 2, 100, 1)
+    runner_assert_eq(r, cfg2.ftp_mode, 0, "ftp_mode defaults to passive")
+    runner_assert_eq(r, cfg2.ftps, 0, "ftps defaults to off")
+    runner_assert_eq(r, cfg2.tls_verify, 1, "tls_verify defaults to on")
+    cfg2.set_ftp_active("10.0.0.5", 40021)
+    runner_assert_eq(r, cfg2.ftp_mode, 1, "set_ftp_active enables active")
+    runner_assert_str_eq(r, cfg2.ftp_active_ip, "10.0.0.5", "active ip stored")
+    runner_assert_eq(r, cfg2.ftp_active_port, 40021, "active port stored")
+    cfg2.set_ftps(1)
+    runner_assert_eq(r, cfg2.ftps, 1, "set_ftps enables")
+    cfg2.set_tls_verify(0)
+    runner_assert_eq(r, cfg2.tls_verify, 0, "set_tls_verify disables")
+    runner_assert_eq(r, cfg2.is_valid(), 1, "extended cfg is valid")
+
+    let adv_builder = pkg::download("ftp://h/f.bin", "f.bin")
+    .ftp_active("10.0.0.5", 40021)
+    .ftps(0)
+    .tls_verify(0)
+    runner_assert_eq(r, adv_builder.config.ftp_mode, 1, "builder ftp_active sets mode")
+    runner_assert_eq(r, adv_builder.config.tls_verify, 0, "builder tls_verify sets flag")
 
     let failed = runner_summary(r)
     if failed > 0

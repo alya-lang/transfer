@@ -19,9 +19,9 @@ pub enum SftpType
     Write = 6,
     Lstat = 7,
     Fstat = 8,
-    Status = 10,
-    Handle = 11,
-    Data = 12,
+    Status = 101,
+    Handle = 102,
+    Data = 103,
     Name = 104
 end
 
@@ -215,4 +215,92 @@ pub function sftp_parse_data(packet: SftpPacket) -> string
     end
     let decoded = decode_sftp_string_bytes(bytes, 9)
     return decoded["value"]
+end
+
+## SFTP server status codes (SSH_FXP_STATUS error field).
+pub enum SftpStatus
+    Ok = 0,
+    Eof = 1,
+    NoSuchFile = 2,
+    PermissionDenied = 3,
+    Failure = 4,
+    BadMessage = 5,
+    NoConnection = 6,
+    ConnectionLost = 7,
+    OperationUnsupported = 8
+end
+
+## Extracts the protocol version from an `SSH_FXP_VERSION` packet.
+##
+## The VERSION reply carries no request id: `[len][2][version:u32]`.
+## Returns -1 when the packet is too short or not a VERSION packet.
+pub function sftp_parse_version(packet: SftpPacket) -> int
+    let bytes = packet.payload_bytes
+    if len(bytes) < 9
+        return -1
+    end
+    if bytes[4] != SftpType.Version
+        return -1
+    end
+    return decode_u32_bytes(bytes, 5)
+end
+
+## Encodes an `SSH_FXP_VERSION` server reply for the negotiated version.
+pub function sftp_build_version(version: int = 3) -> SftpPacket
+    let ver_bytes = encode_u32_bytes(version)
+    let len_prefix = encode_u32_bytes(5)
+    let wire = [len_prefix[0], len_prefix[1], len_prefix[2], len_prefix[3], SftpType.Version, ver_bytes[0], ver_bytes[1], ver_bytes[2], ver_bytes[3]]
+    return SftpPacket {
+        packet_type: SftpType.Version,
+        request_id: 0,
+        payload: "",
+        payload_bytes: wire
+    }
+end
+
+## Encodes an `SSH_FXP_HANDLE` server reply for an opened file.
+pub function sftp_build_handle(request_id: int, handle: string) -> SftpPacket
+    let wire = pack_sftp_wire_packet(SftpType.Handle, request_id, encode_sftp_string_bytes(handle))
+    return SftpPacket {
+        packet_type: SftpType.Handle,
+        request_id: request_id,
+        payload: handle,
+        payload_bytes: wire
+    }
+end
+
+## Encodes an `SSH_FXP_DATA` server reply carrying read bytes.
+pub function sftp_build_data(request_id: int, data: string) -> SftpPacket
+    let wire = pack_sftp_wire_packet(SftpType.Data, request_id, encode_sftp_string_bytes(data))
+    return SftpPacket {
+        packet_type: SftpType.Data,
+        request_id: request_id,
+        payload: data,
+        payload_bytes: wire
+    }
+end
+
+## Encodes an `SSH_FXP_STATUS` server reply (code + message + empty lang).
+pub function sftp_build_status(request_id: int, code: int, message: string = "") -> SftpPacket
+    let code_bytes = encode_u32_bytes(code)
+    let msg_bytes = encode_sftp_string_bytes(message)
+    let lang_bytes = encode_sftp_string_bytes("")
+    let payload = [code_bytes[0], code_bytes[1], code_bytes[2], code_bytes[3]]
+    let i: int = 0
+    while i < len(msg_bytes)
+        payload.push(msg_bytes[i])
+        i += 1
+    end
+    i = 0
+    while i < len(lang_bytes)
+        payload.push(lang_bytes[i])
+        i += 1
+    end
+    let wire = pack_sftp_wire_packet(SftpType.Status, request_id, payload)
+    return SftpPacket {
+        packet_type: SftpType.Status,
+        request_id: request_id,
+        payload: message,
+        payload_bytes: wire
+    }
 end

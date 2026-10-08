@@ -1,8 +1,10 @@
 ## HTTP & HTTPS Range Transfer Engine
 ##
 ## Part of the Alya Language package ecosystem (https://github.com/alya-lang).
-## Implements RFC 7233 byte-range resumable downloads, multipart chunking,
-## chunked uploads, bandwidth throttling, and progress dispatching.
+## Implements RFC 7233 byte-range resumable downloads, chunked uploads,
+## redirect following (RFC 9110), retry with backoff, bandwidth throttling,
+## and progress dispatching. HTTPS hops are served by `./secure.alya` when
+## the `secure` feature is enabled.
 
 import "std/net" as net
 import "../types.alya"
@@ -13,6 +15,9 @@ import "../core/progress.alya"
 import "../core/throttle.alya"
 import "../core/resume.alya"
 import "./range.alya"
+
+@cfg(feature = "secure")
+import "tls" as tls
 
 # ───────────────────────────────────────────────────────────────
 # HTTP Wire Helpers
@@ -96,235 +101,437 @@ pub function parse_http_header_block(raw_headers: string) -> map
 end
 
 # ───────────────────────────────────────────────────────────────
+# Retry & Redirect Policy
+# ───────────────────────────────────────────────────────────────
+
+## Returns 1 when `code` is a redirect status (301, 302, 303, 307, 308).
+pub function http_is_redirect(code: int) -> int
+    if code == 301 or code == 302 or code == 303 or code == 307 or code == 308
+        return 1
+    end
+    return 0
+end
+
+## Returns the number of attempts for a config (max_retries + 1, at least 1).
+pub function retry_max_attempts(cfg: TransferConfig) -> int
+    if cfg is null
+        return 1
+    end
+    let n: int = cfg.max_retries + 1
+    if n < 1
+        n = 1
+    end
+    return n
+end
+
+## Returns the backoff sleep before the next attempt (linear: delay * attempt).
+pub function retry_backoff_ms(cfg: TransferConfig, attempt: int) -> int
+    if cfg is null
+        return 0
+    end
+    if cfg.retry_delay_ms <= 0 or attempt <= 0
+        return 0
+    end
+    return cfg.retry_delay_ms * attempt
+end
+
+## Returns 1 when an HTTP transfer error is worth retrying.
+##
+## Retryable: connection failures, timeouts, TLS transport errors, HTTP 5xx,
+## truncated streams. Fatal: bad URLs, HTTP 4xx, checksum mismatches,
+## missing features, redirect policy violations.
+pub function http_retryable_error(msg: string) -> int
+    if msg is null or msg == ""
+        return 0
+    end
+    if str_has_prefix(msg, "Connection failed") == 1
+        return 1
+    end
+    if str_has_prefix(msg, "Connection refused") == 1
+        return 1
+    end
+    if str_has_substr(msg, "timed out") == 1 or str_has_substr(msg, "timeout") == 1
+        return 1
+    end
+    if str_has_prefix(msg, "TLS connection failed") == 1
+        return 1
+    end
+    if str_has_prefix(msg, "TLS handshake failed") == 1
+        return 1
+    end
+    if str_has_prefix(msg, "TLS send failed") == 1
+        return 1
+    end
+    if str_has_prefix(msg, "Empty reply from server") == 1
+        return 1
+    end
+    if str_has_substr(msg, "closed prematurely") == 1
+        return 1
+    end
+    if str_has_prefix(msg, "HTTP error 5") == 1
+        return 1
+    end
+    return 0
+end
+
+## Builds the request target (path + preserved query string).
+pub function http_request_target(parsed) -> string
+    let target: string = parsed["path"]
+    if target == "" or target is null
+        target = "/"
+    end
+    let q: string = parsed["query"]
+    if q is not null and q != ""
+        target += "?" + q
+    end
+    return target
+end
+
+# ───────────────────────────────────────────────────────────────
 # HTTP Download Transfer Engine
 # ───────────────────────────────────────────────────────────────
 
-## Performs a resumable HTTP range download.
-pub function http_transfer_download(url_str: string, dest_path: string, config: TransferConfig = null, on_progress = null) -> TransferResult
+## Performs a resumable HTTP(S) range download with retry and redirects.
+##
+## Follows up to `max_hops` redirects (auth headers are stripped when the
+## host changes) and retries retryable failures per `max_retries` with
+## linear backoff (`retry_delay_ms`). HTTPS hops require the `secure`
+## feature.
+pub function http_transfer_download(url_str: string, dest_path: string, config: TransferConfig = null, on_progress = null, max_hops: int = 5) -> TransferResult
     let cfg: TransferConfig = config
     if cfg is null
         cfg = make_config()
     end
-    let op_start_ms: int = clock_ms()
-
-    let parsed = parse_transfer_url(url_str)
-    let host: string = parsed["host"]
-    let port: int = parsed["port"]
-    let path: string = parsed["path"]
-    if host == ""
-        return error_result(dest_path, "Invalid URL host: " + url_str)
-    end
-
-    # Check for existing partial file and resume meta
-    let start_offset: int = 0
-    let existing_meta = null
-    if cfg.resumable == 1 and file_exists(dest_path) == true
-        existing_meta = load_resume_meta(dest_path)
-        if existing_meta is not null and existing_meta.url == url_str
-            start_offset = existing_meta.transferred_bytes
-        else
-            if cfg.overwrite == 0
-                start_offset = file_size(dest_path)
+    let attempts: int = retry_max_attempts(cfg)
+    let attempt: int = 0
+    let last: TransferResult = error_result(dest_path, "No attempts made")
+    while attempt < attempts
+        last = http_download_once(url_str, dest_path, cfg, on_progress, max_hops)
+        if last.is_ok() == true
+            return last
+        end
+        if http_retryable_error(last.error_message) == 0
+            return last
+        end
+        attempt += 1
+        if attempt < attempts
+            let wait_ms: int = retry_backoff_ms(cfg, attempt)
+            if wait_ms > 0
+                sleep(wait_ms)
             end
         end
     end
+    return last
+end
 
-    # Connect TCP socket
-    let sock: int = -1
-    try
-        sock = net::tcp_connect(host, port)
-    catch e
-        return error_result(dest_path, "Connection failed to " + host + ":" + str(port))
-    end
-    if sock < 0
-        return error_result(dest_path, "Connection refused: " + host + ":" + str(port))
-    end
+## Single download attempt: follows same-protocol redirects, streams the body.
+##
+## Cross-protocol hops delegate to the HTTPS engine (needs `secure`).
+## Resumes from the partial file when configured, so retries continue
+## where the previous attempt stopped.
+pub function http_download_once(url_str: string, dest_path: string, cfg: TransferConfig, on_progress = null, max_hops: int = 5) -> TransferResult
+    let op_start_ms: int = clock_ms()
+    let current: string = url_str
+    let hops: int = 0
 
-    net::tcp_set_timeout(sock, cfg.timeout_ms)
-
-    # Build request headers
-    let req_headers = {}
-    if cfg.headers is not null
-        let hkeys = cfg.headers.keys()
-        let hi: int = 0
-        while hi < len(hkeys)
-            let hk = hkeys[hi]
-            req_headers[hk] = cfg.headers[hk]
-            hi += 1
+    while true
+        let parsed = parse_transfer_url(current)
+        let scheme: string = parsed["scheme"]
+        let host: string = parsed["host"]
+        let port: int = parsed["port"]
+        if host == ""
+            return error_result(dest_path, "Invalid URL host: " + current, 0, clock_ms() - op_start_ms)
         end
-    end
 
-    if start_offset > 0
-        req_headers["Range"] = build_range_header(start_offset)
-        if existing_meta is not null and existing_meta.etag != ""
-            req_headers["If-Range"] = existing_meta.etag
+        if scheme == "https"
+            return https_download_once(current, dest_path, cfg, on_progress, max_hops - hops)
         end
-    end
-
-    let req_wire: string = build_http_request("GET", host, path, req_headers)
-    net::tcp_send(sock, req_wire)
-
-    # Read response headers until \r\n\r\n
-    let header_buf: string = ""
-    let body_remainder: string = ""
-    let in_headers: int = 1
-
-    while in_headers == 1
-        let chunk: string = net::tcp_recv(sock, 2048)
-        if chunk == ""
-            break
+        if scheme != "http"
+            return error_result(dest_path, "Unsupported URL scheme: " + scheme, 0, clock_ms() - op_start_ms)
         end
-        header_buf += chunk
-        let sep: int = find_index(header_buf, "\r\n\r\n")
-        if sep >= 0
-            body_remainder = slice(header_buf, sep + 4, len(header_buf))
-            header_buf = slice(header_buf, 0, sep)
-            in_headers = 0
+
+        # Check for existing partial file and resume meta
+        let start_offset: int = 0
+        let existing_meta = null
+        if cfg.resumable == 1 and file_exists(dest_path) == true
+            existing_meta = load_resume_meta(dest_path)
+            if existing_meta is not null and existing_meta.url == current
+                start_offset = existing_meta.transferred_bytes
+            else
+                if cfg.overwrite == 0
+                    start_offset = file_size(dest_path)
+                end
+            end
         end
-    end
 
-    let parsed_resp = parse_http_header_block(header_buf)
-    let status_code: int = parsed_resp["status_code"]
-    let resp_headers = parsed_resp["headers"]
-
-    if status_code < 200 or status_code >= 400
-        net::tcp_close(sock)
-        return error_result(dest_path, "HTTP error " + str(status_code) + " " + parsed_resp["status_text"])
-    end
-
-    # Determine total content length
-    let total_bytes: int = -1
-    let is_resumed: int = 0
-    if status_code == 206
-        is_resumed = 1
-        let cr = parse_content_range(str(resp_headers["content-range"]))
-        if cr["valid"] == 1 and cr["total"] > 0
-            total_bytes = cr["total"]
+        # Connect TCP socket
+        let sock: int = -1
+        try
+            sock = net::tcp_connect(host, port)
+        catch e
+            return error_result(dest_path, "Connection failed to " + host + ":" + str(port), 0, clock_ms() - op_start_ms)
         end
-    else
-        start_offset = 0
-        total_bytes = parse_content_length(resp_headers)
-        write_file(dest_path, "")
-    end
+        if sock < 0
+            return error_result(dest_path, "Connection refused: " + host + ":" + str(port), 0, clock_ms() - op_start_ms)
+        end
 
-    let etag: string = extract_etag(resp_headers)
-    let meta = make_resume_meta(url_str, dest_path, total_bytes, start_offset, etag, cfg.chunk_size)
-    save_resume_meta(meta)
+        net::tcp_set_timeout(sock, cfg.timeout_ms)
 
-    # Initialize progress tracker and throttle
-    let now_ms: int = clock_ms()
-    let tracker = progress_tracker_new(total_bytes, now_ms)
-    tracker.bytes_transferred = start_offset
-    let throttle = throttle_new(cfg.rate_limit_bps, now_ms)
+        # Build request headers (fresh per hop; drop auth across hosts)
+        let req_headers = {}
+        if cfg.headers is not null
+            let hkeys = cfg.headers.keys()
+            let hi: int = 0
+            let cross: int = redirect_crosses_host(url_str, current)
+            while hi < len(hkeys)
+                let hk = hkeys[hi]
+                if cross == 0 or lower(hk) != "authorization"
+                    req_headers[hk] = cfg.headers[hk]
+                end
+                hi += 1
+            end
+        end
 
-    # Write initial body remainder if any
-    let transferred: int = start_offset
-    if len(body_remainder) > 0
-        if is_resumed == 1
-            append_file(dest_path, body_remainder)
+        if start_offset > 0
+            req_headers["Range"] = build_range_header(start_offset)
+            if existing_meta is not null and existing_meta.etag != ""
+                req_headers["If-Range"] = existing_meta.etag
+            end
+        end
+
+        let target: string = http_request_target(parsed)
+        let req_wire: string = build_http_request("GET", host, target, req_headers)
+        net::tcp_send(sock, req_wire)
+
+        # Read response headers until \r\n\r\n
+        let header_buf: string = ""
+        let body_remainder: string = ""
+        let in_headers: int = 1
+
+        while in_headers == 1
+            let chunk: string = net::tcp_recv(sock, 2048)
+            if chunk == ""
+                break
+            end
+            header_buf += chunk
+            let sep: int = find_index(header_buf, "\r\n\r\n")
+            if sep >= 0
+                body_remainder = slice(header_buf, sep + 4, len(header_buf))
+                header_buf = slice(header_buf, 0, sep)
+                in_headers = 0
+            end
+        end
+
+        let parsed_resp = parse_http_header_block(header_buf)
+        let status_code: int = parsed_resp["status_code"]
+        let resp_headers = parsed_resp["headers"]
+
+        if status_code == 0
+            net::tcp_close(sock)
+            return error_result(dest_path, "Empty reply from server " + host + ":" + str(port), 0, clock_ms() - op_start_ms)
+        end
+
+        # Redirect handling (RFC 9110): follow Location up the hop budget.
+        if http_is_redirect(status_code) == 1
+            if resp_headers.has("location") == false or str(resp_headers["location"]) == ""
+                net::tcp_close(sock)
+                return error_result(dest_path, "HTTP redirect without Location (status " + str(status_code) + ")", 0, clock_ms() - op_start_ms)
+            end
+            if hops >= max_hops
+                net::tcp_close(sock)
+                return error_result(dest_path, "Too many redirects", 0, clock_ms() - op_start_ms)
+            end
+            let next_url: string = resolve_redirect_url(current, str(resp_headers["location"]))
+            if next_url == ""
+                net::tcp_close(sock)
+                return error_result(dest_path, "Unresolvable redirect Location", 0, clock_ms() - op_start_ms)
+            end
+            net::tcp_close(sock)
+            current = next_url
+            hops += 1
+            continue
+        end
+
+        if status_code < 200 or status_code >= 400
+            net::tcp_close(sock)
+            return error_result(dest_path, "HTTP error " + str(status_code) + " " + parsed_resp["status_text"], 0, clock_ms() - op_start_ms)
+        end
+
+        # Determine total content length
+        let total_bytes: int = -1
+        let is_resumed: int = 0
+        if status_code == 206
+            is_resumed = 1
+            let cr = parse_content_range(str(resp_headers["content-range"]))
+            if cr["valid"] == 1 and cr["total"] > 0
+                total_bytes = cr["total"]
+            end
         else
-            write_file(dest_path, body_remainder)
-        end
-        transferred += len(body_remainder)
-        # Account remainder against the rate cap so the first burst is paced too.
-        throttle_wait(throttle, len(body_remainder))
-        if on_progress is not null
-            let init_prog = progress_update(tracker, transferred, clock_ms())
-            on_progress(init_prog)
-        end
-    end
-
-    # Stream remaining data chunks from socket
-    let read_chunk_size: int = cfg.chunk_size
-    if read_chunk_size <= 0
-        read_chunk_size = 65536
-    end
-
-    let active: int = 1
-    while active == 1
-        let chunk: string = net::tcp_recv(sock, read_chunk_size)
-        let clen: int = len(chunk)
-        if clen == 0
-            active = 0
-            break
+            start_offset = 0
+            total_bytes = parse_content_length(resp_headers)
+            write_file(dest_path, "")
         end
 
-        append_file(dest_path, chunk)
-        transferred += clen
-
-        # Update metadata token
-        meta.transferred_bytes = transferred
+        let etag: string = extract_etag(resp_headers)
+        let meta = make_resume_meta(current, dest_path, total_bytes, start_offset, etag, cfg.chunk_size)
         save_resume_meta(meta)
 
-        # Dispatch live progress callback
-        if on_progress is not null
-            let prog = progress_update(tracker, transferred, clock_ms())
-            on_progress(prog)
-        end
+        # Initialize progress tracker and throttle
+        let now_ms: int = clock_ms()
+        let tracker = progress_tracker_new(total_bytes, now_ms)
+        tracker.bytes_transferred = start_offset
+        let throttle = throttle_new(cfg.rate_limit_bps, now_ms)
 
-        # Apply rate limiting throttle if configured (sleeps when over budget)
-        throttle_wait(throttle, clen)
-
-        if total_bytes > 0 and transferred >= total_bytes
-            active = 0
-            break
-        end
-    end
-
-    net::tcp_close(sock)
-
-    # Verify checksum if configured
-    let actual_checksum: string = ""
-    if cfg.checksum_algo != ChecksumAlgo.None
-        actual_checksum = compute_file_checksum(dest_path, cfg.checksum_algo)
-        if cfg.expected_checksum != ""
-            if lower(actual_checksum) != lower(cfg.expected_checksum)
-                return error_result(dest_path, "Checksum mismatch: expected " + cfg.expected_checksum + ", got " + actual_checksum, transferred, clock_ms() - op_start_ms)
+        # Write initial body remainder if any
+        let transferred: int = start_offset
+        if len(body_remainder) > 0
+            if is_resumed == 1
+                append_file(dest_path, body_remainder)
+            else
+                write_file(dest_path, body_remainder)
+            end
+            transferred += len(body_remainder)
+            # Account remainder against the rate cap so the first burst is paced too.
+            throttle_wait(throttle, len(body_remainder))
+            if on_progress is not null
+                let init_prog = progress_update(tracker, transferred, clock_ms())
+                on_progress(init_prog)
             end
         end
+
+        # Stream remaining data chunks from socket
+        let read_chunk_size: int = cfg.chunk_size
+        if read_chunk_size <= 0
+            read_chunk_size = 65536
+        end
+
+        let active: int = 1
+        while active == 1
+            let chunk: string = net::tcp_recv(sock, read_chunk_size)
+            let clen: int = len(chunk)
+            if clen == 0
+                active = 0
+                break
+            end
+
+            append_file(dest_path, chunk)
+            transferred += clen
+
+            # Update metadata token
+            meta.transferred_bytes = transferred
+            save_resume_meta(meta)
+
+            # Dispatch live progress callback
+            if on_progress is not null
+                let prog = progress_update(tracker, transferred, clock_ms())
+                on_progress(prog)
+            end
+
+            # Apply rate limiting throttle if configured (sleeps when over budget)
+            throttle_wait(throttle, clen)
+
+            if total_bytes > 0 and transferred >= total_bytes
+                active = 0
+                break
+            end
+        end
+
+        net::tcp_close(sock)
+
+        # A known length that was not fully received means truncation: retryable.
+        if total_bytes > 0 and transferred < total_bytes
+            save_resume_meta(meta)
+            return error_result(dest_path, "Connection closed prematurely (" + str(transferred) + "/" + str(total_bytes) + " bytes)", transferred, clock_ms() - op_start_ms)
+        end
+
+        # Verify checksum if configured
+        let actual_checksum: string = ""
+        if cfg.checksum_algo != ChecksumAlgo.None
+            actual_checksum = compute_file_checksum(dest_path, cfg.checksum_algo)
+            if cfg.expected_checksum != ""
+                if lower(actual_checksum) != lower(cfg.expected_checksum)
+                    return error_result(dest_path, "Checksum mismatch: expected " + cfg.expected_checksum + ", got " + actual_checksum, transferred, clock_ms() - op_start_ms)
+                end
+            end
+        end
+
+        # Clean up resume token on completion
+        clear_resume_meta(dest_path)
+
+        return ok_result(dest_path, transferred, total_bytes, actual_checksum, clock_ms() - op_start_ms)
     end
-
-    # Clean up resume token on completion
-    clear_resume_meta(dest_path)
-
-    return ok_result(dest_path, transferred, total_bytes, actual_checksum, clock_ms() - op_start_ms)
+    return error_result(dest_path, "Unreachable redirect loop exit", 0, clock_ms() - op_start_ms)
 end
 
 # ───────────────────────────────────────────────────────────────
 # HTTP Upload Transfer Engine
 # ───────────────────────────────────────────────────────────────
 
-## Performs a chunked / resumable HTTP upload.
+## Performs a chunked HTTP(S) upload with retry.
+##
+## Redirects are not followed for uploads (a 3xx is a fatal error naming
+## the Location); retryable transport failures reuse `max_retries` with
+## linear backoff. HTTPS requires the `secure` feature.
 pub function http_transfer_upload(url_str: string, src_path: string, config: TransferConfig = null, on_progress = null) -> TransferResult
-    if file_exists(src_path) == false
-        return error_result(src_path, "Source file not found: " + src_path)
-    end
-
     let cfg: TransferConfig = config
     if cfg is null
         cfg = make_config()
     end
+    let attempts: int = retry_max_attempts(cfg)
+    let attempt: int = 0
+    let last: TransferResult = error_result(src_path, "No attempts made")
+    while attempt < attempts
+        last = http_upload_once(url_str, src_path, cfg, on_progress)
+        if last.is_ok() == true
+            return last
+        end
+        if http_retryable_error(last.error_message) == 0
+            return last
+        end
+        attempt += 1
+        if attempt < attempts
+            let wait_ms: int = retry_backoff_ms(cfg, attempt)
+            if wait_ms > 0
+                sleep(wait_ms)
+            end
+        end
+    end
+    return last
+end
+
+## Single upload attempt over plain HTTP.
+pub function http_upload_once(url_str: string, src_path: string, cfg: TransferConfig, on_progress = null) -> TransferResult
+    if file_exists(src_path) == false
+        return error_result(src_path, "Source file not found: " + src_path)
+    end
     let op_start_ms: int = clock_ms()
+
+    let parsed = parse_transfer_url(url_str)
+    let scheme: string = parsed["scheme"]
+    let host: string = parsed["host"]
+    let port: int = parsed["port"]
+    if host == ""
+        return error_result(src_path, "Invalid URL host: " + url_str, 0, clock_ms() - op_start_ms)
+    end
+
+    if scheme == "https"
+        return https_upload_once(url_str, src_path, cfg, on_progress)
+    end
+    if scheme != "http"
+        return error_result(src_path, "Unsupported URL scheme: " + scheme, 0, clock_ms() - op_start_ms)
+    end
 
     let file_bytes: int = file_size(src_path)
     let content: string = read_file(src_path)
-
-    let parsed = parse_transfer_url(url_str)
-    let host: string = parsed["host"]
-    let port: int = parsed["port"]
-    let path: string = parsed["path"]
-    if host == ""
-        return error_result(src_path, "Invalid URL host: " + url_str)
-    end
 
     let sock: int = -1
     try
         sock = net::tcp_connect(host, port)
     catch e
-        return error_result(src_path, "Connection failed to " + host + ":" + str(port))
+        return error_result(src_path, "Connection failed to " + host + ":" + str(port), 0, clock_ms() - op_start_ms)
     end
     if sock < 0
-        return error_result(src_path, "Connection refused: " + host + ":" + str(port))
+        return error_result(src_path, "Connection refused: " + host + ":" + str(port), 0, clock_ms() - op_start_ms)
     end
 
     net::tcp_set_timeout(sock, cfg.timeout_ms)
@@ -344,7 +551,8 @@ pub function http_transfer_upload(url_str: string, src_path: string, config: Tra
     end
 
     # Send headers
-    let header_wire: string = build_http_request("POST", host, path, req_headers)
+    let target: string = http_request_target(parsed)
+    let header_wire: string = build_http_request("POST", host, target, req_headers)
     net::tcp_send(sock, header_wire)
 
     # Stream file content in chunks
@@ -376,9 +584,514 @@ pub function http_transfer_upload(url_str: string, src_path: string, config: Tra
     # Read server reply
     let resp_wire: string = net::tcp_recv(sock, 4096)
     net::tcp_close(sock)
+    if resp_wire == ""
+        return error_result(src_path, "Empty reply from server " + host + ":" + str(port), sent, clock_ms() - op_start_ms)
+    end
 
     let parsed_resp = parse_http_header_block(resp_wire)
     let code: int = parsed_resp["status_code"]
+    if http_is_redirect(code) == 1
+        let where: string = ""
+        if parsed_resp["headers"].has("location")
+            where = str(parsed_resp["headers"]["location"])
+        end
+        return error_result(src_path, "HTTP redirect (status " + str(code) + ") is not followed for uploads (Location: " + where + ")", sent, clock_ms() - op_start_ms)
+    end
+    if code < 200 or code >= 300
+        return error_result(src_path, "HTTP upload failed with status " + str(code), sent, clock_ms() - op_start_ms)
+    end
+
+    return ok_result(src_path, sent, file_bytes, "", clock_ms() - op_start_ms)
+end
+
+# ───────────────────────────────────────────────────────────────
+# HTTPS Transfer Engine (requires the `secure` feature)
+# ───────────────────────────────────────────────────────────────
+#
+# TLS-backed mirror of the plain-HTTP engine above, over `alya-lang/tls`.
+# Without `secure`, the fallback stubs in `./lib.alya` report a friendly
+# error instead.
+
+## Opens a verified TLS session to host:port (verify follows cfg.tls_verify).
+##
+## Returns the established context, or null after closing on failure. The
+## human-readable cause is stored in `out_err["message"]`.
+@cfg(feature = "secure")
+pub function https_open_session(host: string, port: int, cfg: TransferConfig, out_err)
+    let tcfg = tls::config(host, port)
+    tcfg.timeout_ms = cfg.timeout_ms
+    if cfg.tls_verify == 0
+        tcfg = tcfg.with_verify(tls::TlsVerifyMode.None)
+    end
+    let ctx = tls::connect(tcfg)
+    if ctx is null
+        out_err["message"] = "TLS connection failed to " + host + ":" + str(port)
+        return null
+    end
+    if ctx.last_error != ""
+        out_err["message"] = "TLS connection failed to " + host + ":" + str(port) + ": " + ctx.last_error
+        tls::close(ctx)
+        return null
+    end
+    let full = tls::tls_handshake_complete(ctx)
+    if full is null
+        out_err["message"] = "TLS handshake failed to " + host + ":" + str(port)
+        tls::close(ctx)
+        return null
+    end
+    if full.last_error != ""
+        out_err["message"] = "TLS handshake failed to " + host + ":" + str(port) + ": " + full.last_error
+        tls::close(full)
+        return null
+    end
+    return full
+end
+
+## Sends a whole wire string over the TLS session (1 = ok, 0 = failed).
+@cfg(feature = "secure")
+pub function https_tls_send(full: TlsContext, wire: string) -> int
+    if full is null
+        return 0
+    end
+    if tls::tls_send_encrypted(full, https_str_to_bytes(wire)) < 0
+        return 0
+    end
+    return 1
+end
+
+## Receives one decrypted chunk as a string ("" on close/error).
+@cfg(feature = "secure")
+pub function https_tls_recv(full: TlsContext) -> string
+    if full is null
+        return ""
+    end
+    let chunk = tls::tls_recv_encrypted(full)
+    if chunk is null or len(chunk) == 0
+        return ""
+    end
+    return https_bytes_to_str(chunk)
+end
+
+## Converts a string into a byte-integer array (inverse of https_bytes_to_str).
+##
+## Ungated pure helper shared by the HTTPS and FTPS engines.
+pub function https_str_to_bytes(s: string) -> array
+    let out = []
+    if s is null
+        return out
+    end
+    let i: int = 0
+    while i < len(s)
+        out.push(ord(char_at(s, i)))
+        i += 1
+    end
+    return out
+end
+
+## Converts a byte-integer array into a string (1:1 mapping, binary-safe).
+##
+## Ungated pure helper shared by the HTTPS and FTPS engines.
+pub function https_bytes_to_str(data) -> string
+    let res: string = ""
+    if data is null
+        return res
+    end
+    let i: int = 0
+    while i < len(data)
+        res += chr(data[i])
+        i += 1
+    end
+    return res
+end
+
+## Closes a TLS session when non-null.
+@cfg(feature = "secure")
+pub function https_close_session(full: TlsContext)
+    if full is not null
+        tls::close(full)
+    end
+end
+
+## Performs a resumable HTTPS range download with retry and redirects.
+@cfg(feature = "secure")
+pub function https_transfer_download(url_str: string, dest_path: string, config: TransferConfig = null, on_progress = null, max_hops: int = 5) -> TransferResult
+    let cfg: TransferConfig = config
+    if cfg is null
+        cfg = make_config()
+    end
+    let attempts: int = retry_max_attempts(cfg)
+    let attempt: int = 0
+    let last: TransferResult = error_result(dest_path, "No attempts made")
+    while attempt < attempts
+        last = https_download_once(url_str, dest_path, cfg, on_progress, max_hops)
+        if last.is_ok() == true
+            return last
+        end
+        if http_retryable_error(last.error_message) == 0
+            return last
+        end
+        attempt += 1
+        if attempt < attempts
+            let wait_ms: int = retry_backoff_ms(cfg, attempt)
+            if wait_ms > 0
+                sleep(wait_ms)
+            end
+        end
+    end
+    return last
+end
+
+## Single HTTPS download attempt with redirect following.
+@cfg(feature = "secure")
+pub function https_download_once(url_str: string, dest_path: string, cfg: TransferConfig, on_progress = null, max_hops: int = 5) -> TransferResult
+    let op_start_ms: int = clock_ms()
+    let current: string = url_str
+    let hops: int = 0
+
+    while true
+        let parsed = parse_transfer_url(current)
+        let scheme: string = parsed["scheme"]
+        let host: string = parsed["host"]
+        let port: int = parsed["port"]
+        if host == ""
+            return error_result(dest_path, "Invalid URL host: " + current, 0, clock_ms() - op_start_ms)
+        end
+
+        if scheme == "http"
+            return http_download_once(current, dest_path, cfg, on_progress, max_hops - hops)
+        end
+        if scheme != "https"
+            return error_result(dest_path, "Unsupported URL scheme: " + scheme, 0, clock_ms() - op_start_ms)
+        end
+
+        # Check for existing partial file and resume meta
+        let start_offset: int = 0
+        let existing_meta = null
+        if cfg.resumable == 1 and file_exists(dest_path) == true
+            existing_meta = load_resume_meta(dest_path)
+            if existing_meta is not null and existing_meta.url == current
+                start_offset = existing_meta.transferred_bytes
+            else
+                if cfg.overwrite == 0
+                    start_offset = file_size(dest_path)
+                end
+            end
+        end
+
+        # Open TLS session
+        let open_err = { "message": "" }
+        let full = https_open_session(host, port, cfg, open_err)
+        if full is null
+            return error_result(dest_path, open_err["message"], 0, clock_ms() - op_start_ms)
+        end
+
+        # Build request headers (fresh per hop; drop auth across hosts)
+        let req_headers = {}
+        if cfg.headers is not null
+            let hkeys = cfg.headers.keys()
+            let hi: int = 0
+            let cross: int = redirect_crosses_host(url_str, current)
+            while hi < len(hkeys)
+                let hk = hkeys[hi]
+                if cross == 0 or lower(hk) != "authorization"
+                    req_headers[hk] = cfg.headers[hk]
+                end
+                hi += 1
+            end
+        end
+
+        if start_offset > 0
+            req_headers["Range"] = build_range_header(start_offset)
+            if existing_meta is not null and existing_meta.etag != ""
+                req_headers["If-Range"] = existing_meta.etag
+            end
+        end
+
+        let target: string = http_request_target(parsed)
+        let req_wire: string = build_http_request("GET", host, target, req_headers)
+        if https_tls_send(full, req_wire) == 0
+            https_close_session(full)
+            return error_result(dest_path, "TLS send failed to " + host + ":" + str(port), 0, clock_ms() - op_start_ms)
+        end
+
+        # Read response headers until \r\n\r\n
+        let header_buf: string = ""
+        let body_remainder: string = ""
+        let in_headers: int = 1
+        let guard: int = 0
+
+        while in_headers == 1 and guard < 512
+            let chunk: string = https_tls_recv(full)
+            if chunk == ""
+                break
+            end
+            header_buf += chunk
+            let sep: int = find_index(header_buf, "\r\n\r\n")
+            if sep >= 0
+                body_remainder = slice(header_buf, sep + 4, len(header_buf))
+                header_buf = slice(header_buf, 0, sep)
+                in_headers = 0
+            end
+            guard += 1
+        end
+
+        let parsed_resp = parse_http_header_block(header_buf)
+        let status_code: int = parsed_resp["status_code"]
+        let resp_headers = parsed_resp["headers"]
+
+        if status_code == 0
+            https_close_session(full)
+            return error_result(dest_path, "Empty reply from server " + host + ":" + str(port), 0, clock_ms() - op_start_ms)
+        end
+
+        # Redirect handling (RFC 9110): follow Location up the hop budget.
+        if http_is_redirect(status_code) == 1
+            if resp_headers.has("location") == false or str(resp_headers["location"]) == ""
+                https_close_session(full)
+                return error_result(dest_path, "HTTP redirect without Location (status " + str(status_code) + ")", 0, clock_ms() - op_start_ms)
+            end
+            if hops >= max_hops
+                https_close_session(full)
+                return error_result(dest_path, "Too many redirects", 0, clock_ms() - op_start_ms)
+            end
+            let next_url: string = resolve_redirect_url(current, str(resp_headers["location"]))
+            if next_url == ""
+                https_close_session(full)
+                return error_result(dest_path, "Unresolvable redirect Location", 0, clock_ms() - op_start_ms)
+            end
+            https_close_session(full)
+            current = next_url
+            hops += 1
+            continue
+        end
+
+        if status_code < 200 or status_code >= 400
+            https_close_session(full)
+            return error_result(dest_path, "HTTP error " + str(status_code) + " " + parsed_resp["status_text"], 0, clock_ms() - op_start_ms)
+        end
+
+        # Determine total content length
+        let total_bytes: int = -1
+        let is_resumed: int = 0
+        if status_code == 206
+            is_resumed = 1
+            let cr = parse_content_range(str(resp_headers["content-range"]))
+            if cr["valid"] == 1 and cr["total"] > 0
+                total_bytes = cr["total"]
+            end
+        else
+            start_offset = 0
+            total_bytes = parse_content_length(resp_headers)
+            write_file(dest_path, "")
+        end
+
+        let etag: string = extract_etag(resp_headers)
+        let meta = make_resume_meta(current, dest_path, total_bytes, start_offset, etag, cfg.chunk_size)
+        save_resume_meta(meta)
+
+        # Initialize progress tracker and throttle
+        let now_ms: int = clock_ms()
+        let tracker = progress_tracker_new(total_bytes, now_ms)
+        tracker.bytes_transferred = start_offset
+        let throttle = throttle_new(cfg.rate_limit_bps, now_ms)
+
+        # Write initial body remainder if any
+        let transferred: int = start_offset
+        if len(body_remainder) > 0
+            if is_resumed == 1
+                append_file(dest_path, body_remainder)
+            else
+                write_file(dest_path, body_remainder)
+            end
+            transferred += len(body_remainder)
+            throttle_wait(throttle, len(body_remainder))
+            if on_progress is not null
+                let init_prog = progress_update(tracker, transferred, clock_ms())
+                on_progress(init_prog)
+            end
+        end
+
+        # Stream remaining data chunks from the TLS session
+        let active: int = 1
+        while active == 1
+            let chunk: string = https_tls_recv(full)
+            let clen: int = len(chunk)
+            if clen == 0
+                active = 0
+                break
+            end
+
+            append_file(dest_path, chunk)
+            transferred += clen
+
+            meta.transferred_bytes = transferred
+            save_resume_meta(meta)
+
+            if on_progress is not null
+                let prog = progress_update(tracker, transferred, clock_ms())
+                on_progress(prog)
+            end
+
+            throttle_wait(throttle, clen)
+
+            if total_bytes > 0 and transferred >= total_bytes
+                active = 0
+                break
+            end
+        end
+
+        https_close_session(full)
+
+        if total_bytes > 0 and transferred < total_bytes
+            save_resume_meta(meta)
+            return error_result(dest_path, "Connection closed prematurely (" + str(transferred) + "/" + str(total_bytes) + " bytes)", transferred, clock_ms() - op_start_ms)
+        end
+
+        # Verify checksum if configured
+        let actual_checksum: string = ""
+        if cfg.checksum_algo != ChecksumAlgo.None
+            actual_checksum = compute_file_checksum(dest_path, cfg.checksum_algo)
+            if cfg.expected_checksum != ""
+                if lower(actual_checksum) != lower(cfg.expected_checksum)
+                    return error_result(dest_path, "Checksum mismatch: expected " + cfg.expected_checksum + ", got " + actual_checksum, transferred, clock_ms() - op_start_ms)
+                end
+            end
+        end
+
+        clear_resume_meta(dest_path)
+
+        return ok_result(dest_path, transferred, total_bytes, actual_checksum, clock_ms() - op_start_ms)
+    end
+    return error_result(dest_path, "Unreachable redirect loop exit", 0, clock_ms() - op_start_ms)
+end
+
+## Performs a chunked HTTPS upload with retry.
+@cfg(feature = "secure")
+pub function https_transfer_upload(url_str: string, src_path: string, config: TransferConfig = null, on_progress = null) -> TransferResult
+    let cfg: TransferConfig = config
+    if cfg is null
+        cfg = make_config()
+    end
+    let attempts: int = retry_max_attempts(cfg)
+    let attempt: int = 0
+    let last: TransferResult = error_result(src_path, "No attempts made")
+    while attempt < attempts
+        last = https_upload_once(url_str, src_path, cfg, on_progress)
+        if last.is_ok() == true
+            return last
+        end
+        if http_retryable_error(last.error_message) == 0
+            return last
+        end
+        attempt += 1
+        if attempt < attempts
+            let wait_ms: int = retry_backoff_ms(cfg, attempt)
+            if wait_ms > 0
+                sleep(wait_ms)
+            end
+        end
+    end
+    return last
+end
+
+## Single HTTPS upload attempt.
+@cfg(feature = "secure")
+pub function https_upload_once(url_str: string, src_path: string, cfg: TransferConfig, on_progress = null) -> TransferResult
+    if file_exists(src_path) == false
+        return error_result(src_path, "Source file not found: " + src_path)
+    end
+    let op_start_ms: int = clock_ms()
+
+    let parsed = parse_transfer_url(url_str)
+    let scheme: string = parsed["scheme"]
+    let host: string = parsed["host"]
+    let port: int = parsed["port"]
+    if host == ""
+        return error_result(src_path, "Invalid URL host: " + url_str, 0, clock_ms() - op_start_ms)
+    end
+
+    if scheme == "http"
+        return http_upload_once(url_str, src_path, cfg, on_progress)
+    end
+    if scheme != "https"
+        return error_result(src_path, "Unsupported URL scheme: " + scheme, 0, clock_ms() - op_start_ms)
+    end
+
+    let file_bytes: int = file_size(src_path)
+    let content: string = read_file(src_path)
+
+    let open_err = { "message": "" }
+    let full = https_open_session(host, port, cfg, open_err)
+    if full is null
+        return error_result(src_path, open_err["message"], 0, clock_ms() - op_start_ms)
+    end
+
+    let req_headers = {
+        "Content-Type": "application/octet-stream",
+        "Content-Length": str(file_bytes)
+    }
+    if cfg.headers is not null
+        let hkeys = cfg.headers.keys()
+        let hi: int = 0
+        while hi < len(hkeys)
+            let hk = hkeys[hi]
+            req_headers[hk] = cfg.headers[hk]
+            hi += 1
+        end
+    end
+
+    let target: string = http_request_target(parsed)
+    let header_wire: string = build_http_request("POST", host, target, req_headers)
+    if https_tls_send(full, header_wire) == 0
+        https_close_session(full)
+        return error_result(src_path, "TLS send failed to " + host + ":" + str(port), 0, clock_ms() - op_start_ms)
+    end
+
+    # Stream file content in chunks
+    let tracker = progress_tracker_new(file_bytes, clock_ms())
+    let throttle = throttle_new(cfg.rate_limit_bps, clock_ms())
+    let chunk_size: int = cfg.chunk_size
+    if chunk_size <= 0
+        chunk_size = 65536
+    end
+
+    let sent: int = 0
+    while sent < file_bytes
+        let end_idx: int = sent + chunk_size
+        if end_idx > file_bytes
+            end_idx = file_bytes
+        end
+        let chunk = slice(content, sent, end_idx)
+        if https_tls_send(full, chunk) == 0
+            https_close_session(full)
+            return error_result(src_path, "TLS send failed to " + host + ":" + str(port), sent, clock_ms() - op_start_ms)
+        end
+        sent = end_idx
+
+        if on_progress is not null
+            let prog = progress_update(tracker, sent, clock_ms())
+            on_progress(prog)
+        end
+
+        throttle_wait(throttle, len(chunk))
+    end
+
+    # Read server reply
+    let resp_wire: string = https_tls_recv(full)
+    https_close_session(full)
+    if resp_wire == ""
+        return error_result(src_path, "Empty reply from server " + host + ":" + str(port), sent, clock_ms() - op_start_ms)
+    end
+
+    let parsed_resp = parse_http_header_block(resp_wire)
+    let code: int = parsed_resp["status_code"]
+    if http_is_redirect(code) == 1
+        let where: string = ""
+        if parsed_resp["headers"].has("location")
+            where = str(parsed_resp["headers"]["location"])
+        end
+        return error_result(src_path, "HTTP redirect (status " + str(code) + ") is not followed for uploads (Location: " + where + ")", sent, clock_ms() - op_start_ms)
+    end
     if code < 200 or code >= 300
         return error_result(src_path, "HTTP upload failed with status " + str(code), sent, clock_ms() - op_start_ms)
     end

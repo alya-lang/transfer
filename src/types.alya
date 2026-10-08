@@ -76,7 +76,12 @@ pub struct TransferConfig
     expected_checksum: string,
     auth_user: string,
     auth_pass: string,
-    headers: map
+    headers: map,
+    ftp_mode: int,
+    ftps: int,
+    tls_verify: int,
+    ftp_active_ip: string,
+    ftp_active_port: int
 end
 
 ## Live progress metric reported during an active transfer.
@@ -140,10 +145,22 @@ end
 # ───────────────────────────────────────────────────────────────
 
 ## Creates a new default `TransferConfig` instance.
-pub function make_config(timeout_ms: int = 15000, chunk_size: int = 65536, max_retries: int = 3, retry_delay_ms: int = 1000, rate_limit_bps: int = 0, resumable: int = 1, overwrite: int = 0) -> TransferConfig
+pub function make_config(timeout_ms: int = 15000, chunk_size: int = 65536, max_retries: int = 3, retry_delay_ms: int = 1000, rate_limit_bps: int = 0, resumable: int = 1, overwrite: int = 0, ftp_mode: int = 0, ftps: int = 0, tls_verify: int = 1, ftp_active_ip: string = "", ftp_active_port: int = 0) -> TransferConfig
     let limit: int = rate_limit_bps
     if limit < 0
         limit = 0
+    end
+    let mode: int = ftp_mode
+    if mode != 0 and mode != 1
+        mode = 0
+    end
+    let secure_ftp: int = ftps
+    if secure_ftp != 0 and secure_ftp != 1
+        secure_ftp = 0
+    end
+    let verify: int = tls_verify
+    if verify != 0 and verify != 1
+        verify = 1
     end
     return TransferConfig {
         timeout_ms: timeout_ms,
@@ -157,7 +174,12 @@ pub function make_config(timeout_ms: int = 15000, chunk_size: int = 65536, max_r
         expected_checksum: "",
         auth_user: "",
         auth_pass: "",
-        headers: {}
+        headers: {},
+        ftp_mode: mode,
+        ftps: secure_ftp,
+        tls_verify: verify,
+        ftp_active_ip: ftp_active_ip,
+        ftp_active_port: ftp_active_port
     }
 end
 
@@ -251,6 +273,18 @@ pub function TransferConfig.is_valid(self: TransferConfig) -> int
     if self.rate_limit_bps < 0
         return 0
     end
+    if self.max_retries < 0 or self.retry_delay_ms < 0
+        return 0
+    end
+    if self.ftp_mode != 0 and self.ftp_mode != 1
+        return 0
+    end
+    if self.ftps != 0 and self.ftps != 1
+        return 0
+    end
+    if self.tls_verify != 0 and self.tls_verify != 1
+        return 0
+    end
     return 1
 end
 
@@ -261,6 +295,44 @@ pub function TransferConfig.set_rate_limit(self: TransferConfig, bps: int) -> Tr
     else
         self.rate_limit_bps = bps
     end
+    return self
+end
+
+## Sets the FTP data connection mode (0 = passive PASV, 1 = active PORT).
+pub function TransferConfig.set_ftp_mode(self: TransferConfig, mode: int) -> TransferConfig
+    if mode == 1
+        self.ftp_mode = 1
+    else
+        self.ftp_mode = 0
+    end
+    return self
+end
+
+## Enables (1) or disables (0) explicit FTPS (AUTH TLS) for FTP transfers.
+pub function TransferConfig.set_ftps(self: TransferConfig, enabled: int) -> TransferConfig
+    if enabled == 1
+        self.ftps = 1
+    else
+        self.ftps = 0
+    end
+    return self
+end
+
+## Enables (1) or disables (0) TLS certificate verification for HTTPS/FTPS.
+pub function TransferConfig.set_tls_verify(self: TransferConfig, enabled: int) -> TransferConfig
+    if enabled == 0
+        self.tls_verify = 0
+    else
+        self.tls_verify = 1
+    end
+    return self
+end
+
+## Sets the advertised address for FTP active mode (server connects back here).
+pub function TransferConfig.set_ftp_active(self: TransferConfig, ip: string, port: int) -> TransferConfig
+    self.ftp_mode = 1
+    self.ftp_active_ip = ip
+    self.ftp_active_port = port
     return self
 end
 

@@ -11,6 +11,7 @@ repository = "https://github.com/alya-lang/transfer"
 keywords = ["alya", "alya-lang", "package", "transfer", "download", "upload", "http-range", "resumable", "ftp", "sftp"]
 
 [dependencies]
+tls = { git = "https://github.com/alya-lang/tls", tag = "v0.1.0", optional = true }
 # Optional dependencies install only when an active feature names them:
 # extra = { git = "https://github.com/alya-lang/extra", tag = "v0.1.0", optional = true }
 
@@ -23,6 +24,7 @@ keywords = ["alya", "alya-lang", "package", "transfer", "download", "upload", "h
 [features]
 default = ["extras"]
 extras = []
+secure = ["tls"]
 # extra = ["extra"]
 
 # [build]

@@ -109,3 +109,77 @@ pub function extract_url_filename(url_or_path: string) -> string
     end
     return p
 end
+
+## Returns the default port for a scheme (80/443/21/22, else 0).
+pub function default_port_for_scheme(scheme: string) -> int
+    let s: string = lower(scheme)
+    if s == "https"
+        return 443
+    end
+    if s == "ftp"
+        return 21
+    end
+    if s == "sftp"
+        return 22
+    end
+    if s == "http"
+        return 80
+    end
+    return 0
+end
+
+## Resolves a redirect `Location` value against the requesting URL.
+##
+## Absolute URLs pass through; scheme-relative (`//host/path`), root-relative
+## (`/path`), and relative (`sub/path`) locations are expanded using the base
+## scheme, host, and non-default port. Returns "" when the location is empty.
+pub function resolve_redirect_url(base_url: string, location: string) -> string
+    if location is null
+        return ""
+    end
+    let loc: string = trim(location)
+    if loc == ""
+        return ""
+    end
+    let low: string = lower(loc)
+    if str_has_prefix(low, "http://") == 1 or str_has_prefix(low, "https://") == 1
+        return loc
+    end
+    if str_has_prefix(low, "ftp://") == 1 or str_has_prefix(low, "sftp://") == 1
+        return loc
+    end
+    let base = parse_transfer_url(base_url)
+    let scheme: string = base["scheme"]
+    if scheme == ""
+        scheme = "http"
+    end
+    if str_has_prefix(loc, "//") == 1
+        return scheme + ":" + loc
+    end
+    let authority: string = base["host"]
+    let port: int = base["port"]
+    if port > 0 and port != default_port_for_scheme(scheme)
+        authority += ":" + str(port)
+    end
+    if str_has_prefix(loc, "/") == 1
+        return scheme + "://" + authority + loc
+    end
+    let dir: string = base["path"]
+    let slash: int = find_last_index(dir, "/")
+    if slash >= 0
+        dir = slice(dir, 0, slash + 1)
+    else
+        dir = "/"
+    end
+    return scheme + "://" + authority + dir + loc
+end
+
+## Returns 1 when two URLs have different hosts (auth must not be forwarded).
+pub function redirect_crosses_host(from_url: string, to_url: string) -> int
+    let a = parse_transfer_url(from_url)
+    let b = parse_transfer_url(to_url)
+    if lower(a["host"]) != lower(b["host"])
+        return 1
+    end
+    return 0
+end

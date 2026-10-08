@@ -27,7 +27,11 @@ pub function format_byte_size(bytes_count: int) -> string
 end
 
 ## Internal helper to format seconds into HH:MM:SS or MM:SS strings.
-pub function format_duration(seconds: int) -> string
+##
+## Named `format_transfer_duration` (not `format_duration`) to avoid colliding
+## with `std/time`'s helper, which enters the closure unaliased through the
+## `secure` feature's transitive dependencies.
+pub function format_transfer_duration(seconds: int) -> string
     if seconds <= 0
         return "00:00"
     end

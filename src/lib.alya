@@ -18,6 +18,7 @@ import "./ftp/protocol.alya"
 import "./ftp/client.alya"
 import "./sftp/packet.alya"
 import "./sftp/protocol.alya"
+import "./sftp/client.alya"
 import "./builder.alya"
 
 @cfg(feature = "extras")
@@ -62,13 +63,17 @@ pub function upload_file(url: string, src_path: string, config: TransferConfig =
 end
 
 ## Performs an FTP file download with optional offset restart (REST) for resume.
-pub function ftp_download(host: string, port: int, user: string, pass: string, remote_path: string, local_path: string, resume: int = 1, on_progress = null, rate_limit_bps: int = 0, chunk_size: int = 65536) -> TransferResult
-    return ftp_download_file(host, port, user, pass, remote_path, local_path, resume, on_progress, rate_limit_bps, chunk_size)
+pub function ftp_download(host: string, port: int, user: string, pass: string, remote_path: string, local_path: string, resume: int = 1, on_progress = null) -> TransferResult
+    let cfg = make_config()
+    cfg.resumable = resume
+    return ftp_download_file(host, port, user, pass, remote_path, local_path, cfg, on_progress)
 end
 
 ## Performs an FTP file upload with optional append mode (APPE) for resume.
-pub function ftp_upload(host: string, port: int, user: string, pass: string, local_path: string, remote_path: string, resume: int = 0, on_progress = null, rate_limit_bps: int = 0, chunk_size: int = 65536) -> TransferResult
-    return ftp_upload_file(host, port, user, pass, local_path, remote_path, resume, on_progress, rate_limit_bps, chunk_size)
+pub function ftp_upload(host: string, port: int, user: string, pass: string, local_path: string, remote_path: string, resume: int = 0, on_progress = null) -> TransferResult
+    let cfg = make_config()
+    cfg.resumable = resume
+    return ftp_upload_file(host, port, user, pass, local_path, remote_path, cfg, on_progress)
 end
 
 # ───────────────────────────────────────────────────────────────
@@ -76,8 +81,8 @@ end
 # ───────────────────────────────────────────────────────────────
 
 ## Creates a default `TransferConfig` instance.
-pub function new_config(timeout_ms: int = 15000, chunk_size: int = 65536, max_retries: int = 3, rate_limit_bps: int = 0, resumable: int = 1) -> TransferConfig
-    return make_config(timeout_ms, chunk_size, max_retries, 1000, rate_limit_bps, resumable, 0)
+pub function new_config(timeout_ms: int = 15000, chunk_size: int = 65536, max_retries: int = 3, rate_limit_bps: int = 0, resumable: int = 1, ftp_mode: int = 0, ftps: int = 0, tls_verify: int = 1) -> TransferConfig
+    return make_config(timeout_ms, chunk_size, max_retries, 1000, rate_limit_bps, resumable, 0, ftp_mode, ftps, tls_verify)
 end
 
 ## Creates a default `TransferProgress` metric record.
@@ -124,5 +129,30 @@ end
 @cfg(not(feature = "extras"))
 pub function format_transfer_banner(title: string) -> string
     throw "extras feature is disabled (rebuild with default features or --features extras)"
+end
+
+## Fallback stub for `https_download_once` when `secure` feature is disabled.
+@cfg(not(feature = "secure"))
+pub function https_download_once(url_str: string, dest_path: string, cfg: TransferConfig, on_progress = null, max_hops: int = 5) -> TransferResult
+    return error_result(dest_path, "HTTPS URL requires the `secure` feature (rebuild with --features secure): " + url_str)
+end
+
+## Fallback stub for `https_upload_once` when `secure` feature is disabled.
+@cfg(not(feature = "secure"))
+pub function https_upload_once(url_str: string, src_path: string, cfg: TransferConfig, on_progress = null) -> TransferResult
+    return error_result(src_path, "HTTPS URL requires the `secure` feature (rebuild with --features secure): " + url_str)
+end
+
+# alya-lint: disable unused-param
+## Fallback stub for `ftps_download_file` when `secure` feature is disabled.
+@cfg(not(feature = "secure"))
+pub function ftps_download_file(host: string, port: int, user: string, pass: string, remote_path: string, local_path: string, cfg: TransferConfig = null, on_progress = null) -> TransferResult
+    return error_result(local_path, "FTPS requires the `secure` feature (rebuild with --features secure)")
+end
+
+## Fallback stub for `ftps_upload_file` when `secure` feature is disabled.
+@cfg(not(feature = "secure"))
+pub function ftps_upload_file(host: string, port: int, user: string, pass: string, local_path: string, remote_path: string, cfg: TransferConfig = null, on_progress = null) -> TransferResult
+    return error_result(local_path, "FTPS requires the `secure` feature (rebuild with --features secure)")
 end
 # alya-lint: enable unused-param

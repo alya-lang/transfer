@@ -1,19 +1,75 @@
 ## Pure RFC 959 FTP Client Engine
 ##
 ## Part of the Alya Language package ecosystem (https://github.com/alya-lang).
-## High-level FTP client supporting binary transfers, passive mode data sockets,
-## restart markers (REST) for resumable downloads/uploads, and progress reporting.
+## High-level FTP client supporting binary transfers, passive (PASV) and
+## active (PORT) data modes, restart markers (REST) for resumable
+## downloads/uploads, retry with backoff, throttling, and progress
+## reporting. Explicit FTPS (AUTH TLS, `secure` feature) lives in the
+## gated section below.
 
 import "std/net" as net
 import "../types.alya"
 import "../core/str_util.alya"
 import "../core/progress.alya"
 import "../core/throttle.alya"
-import "../core/resume.alya"
 import "./protocol.alya"
 
+@cfg(feature = "secure")
+import "tls" as tls
+
 # ───────────────────────────────────────────────────────────────
-# Low-Level FTP Control Socket I/O
+# Retry Policy
+# ───────────────────────────────────────────────────────────────
+
+## Returns 1 when an FTP transfer error is worth retrying.
+##
+## Retryable: connection failures, timeouts, TLS transport errors, transient
+## FTP 4xx replies, truncated streams. Fatal: authentication failures,
+## permanent 5xx replies, missing files, protocol/parse errors, disabled
+## features, bad configuration.
+pub function ftp_retryable_error(msg: string) -> int
+    if msg is null or msg == ""
+        return 0
+    end
+    if str_has_prefix(msg, "FTP control connection failed") == 1
+        return 1
+    end
+    if str_has_prefix(msg, "FTP connection refused") == 1
+        return 1
+    end
+    if str_has_prefix(msg, "Failed to connect to FTP data socket") == 1
+        return 1
+    end
+    if str_has_prefix(msg, "FTP data connection not accepted") == 1
+        return 1
+    end
+    if str_has_substr(msg, "timed out") == 1 or str_has_substr(msg, "timeout") == 1
+        return 1
+    end
+    if str_has_prefix(msg, "TLS connection failed") == 1
+        return 1
+    end
+    if str_has_prefix(msg, "TLS handshake failed") == 1
+        return 1
+    end
+    if str_has_prefix(msg, "TLS send failed") == 1
+        return 1
+    end
+    if str_has_substr(msg, "closed prematurely") == 1
+        return 1
+    end
+    # Transient FTP 4xx replies (e.g. 421 service not available, 450 busy).
+    if str_has_substr(msg, "failed [4") == 1
+        return 1
+    end
+    if str_has_substr(msg, "incomplete [4") == 1
+        return 1
+    end
+    return 0
+end
+
+# ───────────────────────────────────────────────────────────────
+# Low-Level FTP Control Socket I/O (plain)
 # ───────────────────────────────────────────────────────────────
 
 ## Reads a single CRLF-terminated response line from an FTP control socket.
@@ -82,54 +138,162 @@ pub function ftp_get_file_size(sock: int, remote_path: string) -> int
 end
 
 # ───────────────────────────────────────────────────────────────
-# Resumable FTP Download
+# Data Connection Establishment (plain)
 # ───────────────────────────────────────────────────────────────
 
-## Downloads a file from an FTP server with optional offset restart for resume.
+## Opens a passive data connection (PASV + dial). Result map: ok/sock/error.
+pub function ftp_open_data_passive(ctrl_sock: int, timeout_ms: int) -> map
+    let res = { "ok": 0, "sock": -1, "error": "" }
+    let pasv_resp: FtpResponse = ftp_send_cmd(ctrl_sock, "PASV")
+    if pasv_resp.code != 227
+        res["error"] = "FTP PASV failed [" + str(pasv_resp.code) + "]: " + pasv_resp.message
+        return res
+    end
+
+    let pasv_info = ftp_parse_pasv(pasv_resp.message)
+    if pasv_info["valid"] != 1
+        res["error"] = "Failed to parse FTP PASV coordinates"
+        return res
+    end
+
+    let data_ip: string = pasv_info["ip"]
+    let data_port: int = pasv_info["port"]
+    let data_sock: int = -1
+    try
+        data_sock = net::tcp_connect(data_ip, data_port)
+    catch e
+        res["error"] = "Failed to connect to FTP data socket " + data_ip + ":" + str(data_port)
+        return res
+    end
+    if data_sock < 0
+        res["error"] = "Failed to connect to FTP data socket " + data_ip + ":" + str(data_port)
+        return res
+    end
+    net::tcp_set_timeout(data_sock, timeout_ms)
+    res["ok"] = 1
+    res["sock"] = data_sock
+    return res
+end
+
+## Opens an active data connection (listen + PORT + accept).
 ##
-## `rate_limit_bps` caps throughput in bytes/second (0 = unlimited) and is
-## enforced on the data socket via the shared token-bucket throttle.
-## `chunk_size` sets the data-socket read size (<= 0 falls back to 65536).
-pub function ftp_download_file(host: string, port: int, user: string, pass: string, remote_path: string, local_path: string, resume: int = 0, on_progress = null, rate_limit_bps: int = 0, chunk_size: int = 65536) -> TransferResult
+## The caller advertises `local_ip:listen_port` (explicit: NAT-safe); the
+## server connects back after the transfer command is issued, so call this
+## BEFORE sending RETR/STOR and `ftp_accept_data` AFTER. Result map:
+## ok/listen/error.
+pub function ftp_open_data_active(ctrl_sock: int, local_ip: string, listen_port: int) -> map
+    let res = { "ok": 0, "listen": -1, "error": "" }
+    let port_arg: string = ftp_format_port(local_ip, listen_port)
+    if port_arg == ""
+        res["error"] = "FTP active mode needs a valid ftp_active ip/port (got '" + local_ip + "')"
+        return res
+    end
+    let listen_sock: int = net::tcp_listen(listen_port)
+    if listen_sock < 0
+        res["error"] = "FTP active listen failed on port " + str(listen_port)
+        return res
+    end
+    let port_resp: FtpResponse = ftp_send_cmd(ctrl_sock, "PORT", port_arg)
+    if port_resp.code != 200
+        net::tcp_close(listen_sock)
+        res["error"] = "FTP PORT failed [" + str(port_resp.code) + "]: " + port_resp.message
+        return res
+    end
+    res["ok"] = 1
+    res["listen"] = listen_sock
+    return res
+end
+
+## Accepts the server's data connection on a listening active-mode socket.
+pub function ftp_accept_data(listen_sock: int, timeout_ms: int) -> map
+    let res = { "ok": 0, "sock": -1, "error": "" }
+    let data_sock: int = net::tcp_accept(listen_sock)
+    net::tcp_close(listen_sock)
+    if data_sock < 0
+        res["error"] = "FTP data connection not accepted by server"
+        return res
+    end
+    net::tcp_set_timeout(data_sock, timeout_ms)
+    res["ok"] = 1
+    res["sock"] = data_sock
+    return res
+end
+
+# ───────────────────────────────────────────────────────────────
+# Resumable FTP Download (plain)
+# ───────────────────────────────────────────────────────────────
+
+## Downloads a file from an FTP server with retry and optional resume.
+##
+## Behavior comes from `cfg`: `resumable` (REST offset restart),
+## `rate_limit_bps` + `chunk_size` (throttled data loop),
+## `timeout_ms` (control + data sockets), `ftp_mode` (0 passive, 1 active
+## with `ftp_active_ip`/`ftp_active_port`), `max_retries`/`retry_delay_ms`.
+## Set `ftps = 1` for explicit FTPS (needs the `secure` feature).
+pub function ftp_download_file(host: string, port: int, user: string, pass: string, remote_path: string, local_path: string, cfg: TransferConfig = null, on_progress = null) -> TransferResult
+    let use_cfg: TransferConfig = cfg
+    if use_cfg is null
+        use_cfg = make_config()
+    end
+    if use_cfg.ftps == 1
+        return ftps_download_file(host, port, user, pass, remote_path, local_path, use_cfg, on_progress)
+    end
+    let attempts: int = retry_max_attempts(use_cfg)
+    let attempt: int = 0
+    let last: TransferResult = error_result(local_path, "No attempts made")
+    while attempt < attempts
+        last = ftp_download_once(host, port, user, pass, remote_path, local_path, use_cfg, on_progress)
+        if last.is_ok() == 1
+            return last
+        end
+        if ftp_retryable_error(last.error_message) == 0
+            return last
+        end
+        attempt += 1
+        if attempt < attempts
+            let wait_ms: int = retry_backoff_ms(use_cfg, attempt)
+            if wait_ms > 0
+                sleep(wait_ms)
+            end
+        end
+    end
+    return last
+end
+
+## Single FTP download attempt over a plain control connection.
+pub function ftp_download_once(host: string, port: int, user: string, pass: string, remote_path: string, local_path: string, cfg: TransferConfig, on_progress = null) -> TransferResult
     let op_start_ms: int = clock_ms()
-    let limit: int = rate_limit_bps
-    if limit < 0
-        limit = 0
-    end
-    let read_size: int = chunk_size
-    if read_size <= 0
-        read_size = 65536
-    end
     let ctrl_sock: int = -1
     try
         ctrl_sock = net::tcp_connect(host, port)
     catch e
-        return error_result(local_path, "FTP control connection failed to " + host + ":" + str(port))
+        return error_result(local_path, "FTP control connection failed to " + host + ":" + str(port), 0, clock_ms() - op_start_ms)
     end
     if ctrl_sock < 0
-        return error_result(local_path, "FTP connection refused: " + host + ":" + str(port))
+        return error_result(local_path, "FTP connection refused: " + host + ":" + str(port), 0, clock_ms() - op_start_ms)
     end
+    net::tcp_set_timeout(ctrl_sock, cfg.timeout_ms)
 
     # Read greeting banner
     let banner: string = ftp_read_line(ctrl_sock)
     let b_resp: FtpResponse = ftp_parse_response(banner)
     if b_resp.code != 220
         net::tcp_close(ctrl_sock)
-        return error_result(local_path, "Unexpected FTP greeting: " + banner)
+        return error_result(local_path, "Unexpected FTP greeting [" + str(b_resp.code) + "]: " + banner, 0, clock_ms() - op_start_ms)
     end
 
     # Authenticate
     let auth_resp: FtpResponse = ftp_login(ctrl_sock, user, pass)
     if auth_resp.code != 230
         net::tcp_close(ctrl_sock)
-        return error_result(local_path, "FTP login failed: " + auth_resp.message)
+        return error_result(local_path, "FTP login failed [" + str(auth_resp.code) + "]: " + auth_resp.message, 0, clock_ms() - op_start_ms)
     end
 
     # Set binary transfer mode
     let type_resp: FtpResponse = ftp_send_cmd(ctrl_sock, "TYPE", "I")
     if type_resp.code != 200
         net::tcp_close(ctrl_sock)
-        return error_result(local_path, "FTP TYPE I failed: " + type_resp.message)
+        return error_result(local_path, "FTP TYPE I failed [" + str(type_resp.code) + "]: " + type_resp.message, 0, clock_ms() - op_start_ms)
     end
 
     # Query file size
@@ -137,58 +301,73 @@ pub function ftp_download_file(host: string, port: int, user: string, pass: stri
 
     # Check local partial file for resume
     let offset: int = 0
+    let resume: int = cfg.resumable
     if resume == 1 and file_exists(local_path) == true
         offset = file_size(local_path)
     else
         write_file(local_path, "")
     end
 
-    # Enter Passive Mode
-    let pasv_resp: FtpResponse = ftp_send_cmd(ctrl_sock, "PASV")
-    if pasv_resp.code != 227
-        net::tcp_close(ctrl_sock)
-        return error_result(local_path, "FTP PASV failed: " + pasv_resp.message)
-    end
-
-    let pasv_info = ftp_parse_pasv(pasv_resp.message)
-    if pasv_info["valid"] != 1
-        net::tcp_close(ctrl_sock)
-        return error_result(local_path, "Failed to parse FTP PASV coordinates")
-    end
-
-    let data_ip: string = pasv_info["ip"]
-    let data_port: int = pasv_info["port"]
-
-    # Connect to passive data socket
+    # Establish the data connection
     let data_sock: int = -1
-    try
-        data_sock = net::tcp_connect(data_ip, data_port)
-    catch e
-        net::tcp_close(ctrl_sock)
-        return error_result(local_path, "Failed to connect to FTP data socket " + data_ip + ":" + str(data_port))
-    end
-
-    # If resuming, issue REST command
-    if offset > 0
-        let rest_resp: FtpResponse = ftp_send_cmd(ctrl_sock, "REST", str(offset))
-        if rest_resp.code != 350
-            offset = 0
-            write_file(local_path, "")
+    if cfg.ftp_mode == 1
+        let act = ftp_open_data_active(ctrl_sock, cfg.ftp_active_ip, cfg.ftp_active_port)
+        if act["ok"] == 0
+            net::tcp_close(ctrl_sock)
+            return error_result(local_path, str(act["error"]), 0, clock_ms() - op_start_ms)
+        end
+        # If resuming, issue REST before RETR
+        if offset > 0
+            let rest_resp: FtpResponse = ftp_send_cmd(ctrl_sock, "REST", str(offset))
+            if rest_resp.code != 350
+                offset = 0
+                write_file(local_path, "")
+            end
+        end
+        let retr_resp: FtpResponse = ftp_send_cmd(ctrl_sock, "RETR", remote_path)
+        if retr_resp.code != 150 and retr_resp.code != 125
+            net::tcp_close(act["listen"])
+            net::tcp_close(ctrl_sock)
+            return error_result(local_path, "FTP RETR failed [" + str(retr_resp.code) + "]: " + retr_resp.message, offset, clock_ms() - op_start_ms)
+        end
+        let acc = ftp_accept_data(act["listen"], cfg.timeout_ms)
+        if acc["ok"] == 0
+            net::tcp_close(ctrl_sock)
+            return error_result(local_path, str(acc["error"]), offset, clock_ms() - op_start_ms)
+        end
+        data_sock = acc["sock"]
+    else
+        let pasv = ftp_open_data_passive(ctrl_sock, cfg.timeout_ms)
+        if pasv["ok"] == 0
+            net::tcp_close(ctrl_sock)
+            return error_result(local_path, str(pasv["error"]), 0, clock_ms() - op_start_ms)
+        end
+        data_sock = pasv["sock"]
+        # If resuming, issue REST command
+        if offset > 0
+            let rest_resp: FtpResponse = ftp_send_cmd(ctrl_sock, "REST", str(offset))
+            if rest_resp.code != 350
+                offset = 0
+                write_file(local_path, "")
+            end
+        end
+        # Issue RETR command
+        let retr_resp: FtpResponse = ftp_send_cmd(ctrl_sock, "RETR", remote_path)
+        if retr_resp.code != 150 and retr_resp.code != 125
+            net::tcp_close(data_sock)
+            net::tcp_close(ctrl_sock)
+            return error_result(local_path, "FTP RETR failed [" + str(retr_resp.code) + "]: " + retr_resp.message, offset, clock_ms() - op_start_ms)
         end
     end
 
-    # Issue RETR command
-    let retr_resp: FtpResponse = ftp_send_cmd(ctrl_sock, "RETR", remote_path)
-    if retr_resp.code != 150 and retr_resp.code != 125
-        net::tcp_close(data_sock)
-        net::tcp_close(ctrl_sock)
-        return error_result(local_path, "FTP RETR failed: " + retr_resp.message)
-    end
-
     # Receive data stream from data socket
+    let read_size: int = cfg.chunk_size
+    if read_size <= 0
+        read_size = 65536
+    end
     let tracker = progress_tracker_new(remote_size, clock_ms())
     tracker.bytes_transferred = offset
-    let throttle = throttle_new(limit, clock_ms())
+    let throttle = throttle_new(cfg.rate_limit_bps, clock_ms())
     let transferred: int = offset
 
     let receiving: int = 1
@@ -221,30 +400,60 @@ pub function ftp_download_file(host: string, port: int, user: string, pass: stri
     net::tcp_close(ctrl_sock)
 
     if done_resp.code != 226 and done_resp.code != 250
-        return error_result(local_path, "FTP transfer incomplete: " + done_resp.message, transferred, clock_ms() - op_start_ms)
+        return error_result(local_path, "FTP transfer incomplete [" + str(done_resp.code) + "]: " + done_resp.message, transferred, clock_ms() - op_start_ms)
     end
 
     return ok_result(local_path, transferred, remote_size, "", clock_ms() - op_start_ms)
 end
 
 # ───────────────────────────────────────────────────────────────
-# Resumable FTP Upload
+# Resumable FTP Upload (plain)
 # ───────────────────────────────────────────────────────────────
 
-## Uploads a file to an FTP server with optional append mode for resume.
+## Uploads a file to an FTP server with retry and optional resume.
 ##
-## `rate_limit_bps` caps throughput in bytes/second (0 = unlimited) and is
-## enforced while streaming to the data socket. `chunk_size` sets the send
-## slice size (<= 0 falls back to 65536).
-pub function ftp_upload_file(host: string, port: int, user: string, pass: string, local_path: string, remote_path: string, resume: int = 0, on_progress = null, rate_limit_bps: int = 0, chunk_size: int = 65536) -> TransferResult
+## Retries restart from scratch (STOR) so a resumed append (APPE) is never
+## duplicated. Otherwise behavior follows `cfg` like the download engine.
+pub function ftp_upload_file(host: string, port: int, user: string, pass: string, local_path: string, remote_path: string, cfg: TransferConfig = null, on_progress = null) -> TransferResult
+    let use_cfg: TransferConfig = cfg
+    if use_cfg is null
+        use_cfg = make_config()
+    end
+    if use_cfg.ftps == 1
+        return ftps_upload_file(host, port, user, pass, local_path, remote_path, use_cfg, on_progress)
+    end
+    let attempts: int = retry_max_attempts(use_cfg)
+    let attempt: int = 0
+    let last: TransferResult = error_result(local_path, "No attempts made")
+    while attempt < attempts
+        let force_fresh: int = 0
+        if attempt > 0
+            force_fresh = 1
+        end
+        last = ftp_upload_once(host, port, user, pass, local_path, remote_path, use_cfg, on_progress, force_fresh)
+        if last.is_ok() == 1
+            return last
+        end
+        if ftp_retryable_error(last.error_message) == 0
+            return last
+        end
+        attempt += 1
+        if attempt < attempts
+            let wait_ms: int = retry_backoff_ms(use_cfg, attempt)
+            if wait_ms > 0
+                sleep(wait_ms)
+            end
+        end
+    end
+    return last
+end
+
+## Single FTP upload attempt over a plain control connection.
+pub function ftp_upload_once(host: string, port: int, user: string, pass: string, local_path: string, remote_path: string, cfg: TransferConfig, on_progress = null, force_fresh: int = 0) -> TransferResult
     if file_exists(local_path) == false
         return error_result(local_path, "Local file not found: " + local_path)
     end
     let op_start_ms: int = clock_ms()
-    let limit: int = rate_limit_bps
-    if limit < 0
-        limit = 0
-    end
 
     let file_bytes: int = file_size(local_path)
     let content: string = read_file(local_path)
@@ -253,55 +462,72 @@ pub function ftp_upload_file(host: string, port: int, user: string, pass: string
     try
         ctrl_sock = net::tcp_connect(host, port)
     catch e
-        return error_result(local_path, "FTP control connection failed: " + host + ":" + str(port))
+        return error_result(local_path, "FTP control connection failed: " + host + ":" + str(port), 0, clock_ms() - op_start_ms)
     end
     if ctrl_sock < 0
-        return error_result(local_path, "FTP connection refused: " + host + ":" + str(port))
+        return error_result(local_path, "FTP connection refused: " + host + ":" + str(port), 0, clock_ms() - op_start_ms)
     end
+    net::tcp_set_timeout(ctrl_sock, cfg.timeout_ms)
 
     let _banner = ftp_read_line(ctrl_sock)
     let auth_resp = ftp_login(ctrl_sock, user, pass)
     if auth_resp.code != 230
         net::tcp_close(ctrl_sock)
-        return error_result(local_path, "FTP login failed: " + auth_resp.message)
+        return error_result(local_path, "FTP login failed [" + str(auth_resp.code) + "]: " + auth_resp.message, 0, clock_ms() - op_start_ms)
     end
 
     ftp_send_cmd(ctrl_sock, "TYPE", "I")
 
-    # Enter Passive Mode
-    let pasv_resp = ftp_send_cmd(ctrl_sock, "PASV")
-    let pasv_info = ftp_parse_pasv(pasv_resp.message)
-    if pasv_info["valid"] != 1
-        net::tcp_close(ctrl_sock)
-        return error_result(local_path, "Failed to parse FTP PASV coordinates")
-    end
-
+    # Establish the data connection
     let data_sock: int = -1
-    try
-        data_sock = net::tcp_connect(pasv_info["ip"], pasv_info["port"])
-    catch e
-        net::tcp_close(ctrl_sock)
-        return error_result(local_path, "Failed to connect to FTP data socket")
-    end
-
-    let cmd = "STOR"
-    if resume == 1
-        cmd = "APPE"
-    end
-    let stor_resp = ftp_send_cmd(ctrl_sock, cmd, remote_path)
-    if stor_resp.code != 150 and stor_resp.code != 125
-        net::tcp_close(data_sock)
-        net::tcp_close(ctrl_sock)
-        return error_result(local_path, "FTP " + cmd + " failed: " + stor_resp.message)
+    if cfg.ftp_mode == 1
+        let act = ftp_open_data_active(ctrl_sock, cfg.ftp_active_ip, cfg.ftp_active_port)
+        if act["ok"] == 0
+            net::tcp_close(ctrl_sock)
+            return error_result(local_path, str(act["error"]), 0, clock_ms() - op_start_ms)
+        end
+        let cmd = "STOR"
+        if cfg.resumable == 1 and force_fresh == 0
+            cmd = "APPE"
+        end
+        let stor_resp = ftp_send_cmd(ctrl_sock, cmd, remote_path)
+        if stor_resp.code != 150 and stor_resp.code != 125
+            net::tcp_close(act["listen"])
+            net::tcp_close(ctrl_sock)
+            return error_result(local_path, "FTP " + cmd + " failed [" + str(stor_resp.code) + "]: " + stor_resp.message, 0, clock_ms() - op_start_ms)
+        end
+        let acc = ftp_accept_data(act["listen"], cfg.timeout_ms)
+        if acc["ok"] == 0
+            net::tcp_close(ctrl_sock)
+            return error_result(local_path, str(acc["error"]), 0, clock_ms() - op_start_ms)
+        end
+        data_sock = acc["sock"]
+    else
+        let pasv = ftp_open_data_passive(ctrl_sock, cfg.timeout_ms)
+        if pasv["ok"] == 0
+            net::tcp_close(ctrl_sock)
+            return error_result(local_path, str(pasv["error"]), 0, clock_ms() - op_start_ms)
+        end
+        data_sock = pasv["sock"]
+        let cmd = "STOR"
+        if cfg.resumable == 1 and force_fresh == 0
+            cmd = "APPE"
+        end
+        let stor_resp = ftp_send_cmd(ctrl_sock, cmd, remote_path)
+        if stor_resp.code != 150 and stor_resp.code != 125
+            net::tcp_close(data_sock)
+            net::tcp_close(ctrl_sock)
+            return error_result(local_path, "FTP " + cmd + " failed [" + str(stor_resp.code) + "]: " + stor_resp.message, 0, clock_ms() - op_start_ms)
+        end
     end
 
     # Stream content to data socket
-    let tracker = progress_tracker_new(file_bytes, clock_ms())
-    let throttle = throttle_new(limit, clock_ms())
-    let send_size: int = chunk_size
+    let send_size: int = cfg.chunk_size
     if send_size <= 0
         send_size = 65536
     end
+    let tracker = progress_tracker_new(file_bytes, clock_ms())
+    let throttle = throttle_new(cfg.rate_limit_bps, clock_ms())
     let sent: int = 0
 
     while sent < file_bytes
@@ -330,8 +556,550 @@ pub function ftp_upload_file(host: string, port: int, user: string, pass: string
     net::tcp_close(ctrl_sock)
 
     if done_resp.code != 226 and done_resp.code != 250
-        return error_result(local_path, "FTP upload incomplete: " + done_resp.message, sent, clock_ms() - op_start_ms)
+        return error_result(local_path, "FTP upload incomplete [" + str(done_resp.code) + "]: " + done_resp.message, sent, clock_ms() - op_start_ms)
     end
 
+    return ok_result(local_path, sent, file_bytes, "", clock_ms() - op_start_ms)
+end
+
+# ───────────────────────────────────────────────────────────────
+# Explicit FTPS (AUTH TLS, requires the `secure` feature)
+# ───────────────────────────────────────────────────────────────
+#
+# Upgrades a connected TCP socket to TLS in place (same handshake the
+# `tls` package runs, minus its own dial). Without `secure`, the fallback
+# stubs in `./lib.alya` report a friendly error instead.
+
+## Upgrades a connected socket to TLS. Returns ctx or null (err in map).
+@cfg(feature = "secure")
+pub function ftps_upgrade_socket(sock: int, host: string, port: int, cfg: TransferConfig, out_err) -> map
+    let res = { "ctx": null, "error": "" }
+    let tcfg = tls::config(host, port)
+    tcfg.timeout_ms = cfg.timeout_ms
+    if cfg.tls_verify == 0
+        tcfg = tcfg.with_verify(tls::TlsVerifyMode.None)
+    end
+    if tcfg.is_valid() == 0
+        res["error"] = "Invalid FTPS endpoint " + host + ":" + str(port)
+        return res
+    end
+    let ctx = tls::tls_context_new(tcfg)
+    if ctx is null
+        res["error"] = "TLS context failed for " + host + ":" + str(port)
+        return res
+    end
+    ctx.sock = sock
+    ctx.state = tls::TlsState.TcpConnected
+    let hello = tls::build_client_hello(tcfg)
+    if tls::raw_send(sock, hello["bytes"]) < 0
+        res["error"] = "TLS ClientHello send failed to " + host + ":" + str(port)
+        return res
+    end
+    ctx.state = tls::TlsState.HandshakeStarted
+    let raw = []
+    let tries: int = 0
+    while tries < 8
+        let st = tls::raw_recv_status(sock, 4096)
+        if st["closed"] == 1
+            break
+        end
+        let piece = st["data"]
+        let c: int = 0
+        while c < len(piece)
+            raw.push(piece[c])
+            c += 1
+        end
+        if len(raw) >= 5
+            break
+        end
+        tries += 1
+    end
+    if len(raw) < 5
+        res["error"] = "TLS handshake failed to " + host + ":" + str(port) + ": no ServerHello received"
+        return res
+    end
+    let rec = tls::record_decode(raw)
+    if rec["error"] != ""
+        res["error"] = "TLS handshake failed to " + host + ":" + str(port) + ": " + rec["error"]
+        return res
+    end
+    if rec["type"] == tls::TlsContentType.Alert
+        res["error"] = "TLS handshake failed to " + host + ":" + str(port) + ": peer returned TLS alert"
+        return res
+    end
+    if rec["type"] != tls::TlsContentType.Handshake or len(rec["fragment"]) < 4
+        res["error"] = "TLS handshake failed to " + host + ":" + str(port) + ": unexpected record"
+        return res
+    end
+    let frag = rec["fragment"]
+    if frag[0] != tls::TlsHandshakeType.ServerHello
+        res["error"] = "TLS handshake failed to " + host + ":" + str(port) + ": expected ServerHello"
+        return res
+    end
+    let body = []
+    let b: int = 4
+    while b < len(frag)
+        body.push(frag[b])
+        b += 1
+    end
+    let sh = tls::parse_server_hello(body)
+    if sh["error"] != ""
+        res["error"] = "TLS handshake failed to " + host + ":" + str(port) + ": " + sh["error"]
+        return res
+    end
+    let negotiated = tls::version_negotiate(tcfg.min_version, tcfg.max_version, sh["version"])
+    if negotiated == 0
+        res["error"] = "TLS handshake failed to " + host + ":" + str(port) + ": no overlapping TLS version"
+        return res
+    end
+    if tls::cipher_strength(sh["cipher_suite"]) == 0
+        res["error"] = "TLS handshake failed to " + host + ":" + str(port) + ": unknown cipher suite"
+        return res
+    end
+    ctx.session.version = negotiated
+    ctx.session.cipher_suite = sh["cipher_suite"]
+    ctx.session.id_hex = sh["session_id"]
+    ctx.session.state = tls::TlsState.Handshaked
+    ctx.session.created_ms = clock_ms()
+    ctx.state = tls::TlsState.Handshaked
+    ctx.keys["client_random"] = hello["random"]
+    ctx.keys["server_random"] = sh["random"]
+    let tscript = ftps_slice_bytes(hello["bytes"], 5, len(hello["bytes"]) - 5)
+    ctx.keys["transcript"] = tls::tls_transcript_append(tscript, tls::TlsHandshakeType.ServerHello, ftps_slice_bytes(body, 0, len(body)))
+    let leftover = ftps_slice_bytes(raw, rec["consumed"], len(raw) - rec["consumed"])
+    let chained = tls::tls_read_peer_chain(ctx, leftover)
+    if chained.last_error != ""
+        res["error"] = "TLS handshake failed to " + host + ":" + str(port) + ": " + chained.last_error
+        return res
+    end
+    let full = tls::tls_handshake_complete(chained)
+    if full.last_error != ""
+        res["error"] = "TLS handshake failed to " + host + ":" + str(port) + ": " + full.last_error
+        return res
+    end
+    res["ctx"] = full
+    return res
+end
+
+## Copies a byte window from an array.
+@cfg(feature = "secure")
+pub function ftps_slice_bytes(data, offset: int, n: int) -> array
+    let part = []
+    if data is null or n <= 0
+        return part
+    end
+    let i: int = 0
+    while i < n and offset + i < len(data)
+        part.push(data[offset + i])
+        i += 1
+    end
+    return part
+end
+
+## Reads one CRLF line from an FTPS control session (buffered TLS reads).
+@cfg(feature = "secure")
+pub function ftps_read_line(sess) -> string
+    let buf = sess["inbuf"]
+    while true
+        # Scan buffered bytes for CRLF
+        let i: int = 0
+        while i + 1 < len(buf)
+            if buf[i] == 13 and buf[i + 1] == 10
+                let line_bytes = ftps_slice_bytes(buf, 0, i)
+                sess["inbuf"] = ftps_slice_bytes(buf, i + 2, len(buf) - i - 2)
+                return https_bytes_to_str(line_bytes) + "\r\n"
+            end
+            i += 1
+        end
+        let piece = tls::tls_recv_encrypted(sess["tls"])
+        if piece is null or len(piece) == 0
+            if len(buf) == 0
+                return ""
+            end
+            let rest: string = https_bytes_to_str(buf)
+            sess["inbuf"] = []
+            return rest
+        end
+        let j: int = 0
+        while j < len(piece)
+            buf.push(piece[j])
+            j += 1
+        end
+        sess["inbuf"] = buf
+    end
+    return ""
+end
+
+## Sends a command on an FTPS control session and reads the reply.
+@cfg(feature = "secure")
+pub function ftps_send_cmd(sess, cmd: string, arg: string = "") -> FtpResponse
+    let wire: string = ftp_format_command(cmd, arg)
+    tls::tls_send_encrypted(sess["tls"], https_str_to_bytes(wire))
+    let line: string = ftps_read_line(sess)
+    let resp: FtpResponse = ftp_parse_response(line)
+    if len(line) >= 4 and char_at(line, 3) == "-"
+        let cont_prefix: string = slice(line, 0, 3) + " "
+        let reading_multi: int = 1
+        while reading_multi == 1
+            let next_line: string = ftps_read_line(sess)
+            if next_line == "" or str_has_prefix(next_line, cont_prefix) == 1
+                resp = ftp_parse_response(next_line)
+                reading_multi = 0
+                break
+            end
+        end
+    end
+    return resp
+end
+
+## FTPS session login helper (banner + USER/PASS + AUTH TLS + PBSZ/PROT).
+##
+## Takes an open plain `sock`, returns a session map {ok, sock, tls, inbuf,
+## error}. On any failure the socket is closed.
+@cfg(feature = "secure")
+pub function ftps_login_session(sock: int, host: string, port: int, user: string, pass: string, cfg: TransferConfig) -> map
+    let sess = { "ok": 0, "sock": sock, "tls": null, "inbuf": [], "error": "" }
+    let banner: string = ftp_read_line(sock)
+    let b_resp: FtpResponse = ftp_parse_response(banner)
+    if b_resp.code != 220
+        sess["error"] = "Unexpected FTP greeting [" + str(b_resp.code) + "]: " + banner
+        net::tcp_close(sock)
+        return sess
+    end
+    let auth: FtpResponse = ftp_send_cmd(sock, "AUTH", "TLS")
+    if auth.code != 234
+        sess["error"] = "FTP AUTH TLS not accepted [" + str(auth.code) + "]: " + auth.message
+        net::tcp_close(sock)
+        return sess
+    end
+    let up_err = { "message": "" }
+    let up = ftps_upgrade_socket(sock, host, port, cfg, up_err)
+    if up["ctx"] is null
+        sess["error"] = str(up["error"])
+        if sess["error"] == ""
+            sess["error"] = str(up_err["message"])
+        end
+        net::tcp_close(sock)
+        return sess
+    end
+    sess["tls"] = up["ctx"]
+    let pbsz: FtpResponse = ftps_send_cmd(sess, "PBSZ", "0")
+    if pbsz.code != 200
+        sess["error"] = "FTPS PBSZ failed [" + str(pbsz.code) + "]: " + pbsz.message
+        ftps_close_session(sess)
+        return sess
+    end
+    let prot: FtpResponse = ftps_send_cmd(sess, "PROT", "P")
+    if prot.code != 200
+        sess["error"] = "FTPS PROT P failed [" + str(prot.code) + "]: " + prot.message
+        ftps_close_session(sess)
+        return sess
+    end
+    let login: FtpResponse = ftps_send_cmd(sess, "USER", user)
+    if login.code == 331
+        login = ftps_send_cmd(sess, "PASS", pass)
+    end
+    if login.code != 230
+        sess["error"] = "FTP login failed [" + str(login.code) + "]: " + login.message
+        ftps_close_session(sess)
+        return sess
+    end
+    let type_resp: FtpResponse = ftps_send_cmd(sess, "TYPE", "I")
+    if type_resp.code != 200
+        sess["error"] = "FTP TYPE I failed [" + str(type_resp.code) + "]: " + type_resp.message
+        ftps_close_session(sess)
+        return sess
+    end
+    sess["ok"] = 1
+    return sess
+end
+
+## Closes an FTPS control session (QUIT best-effort, then TLS close).
+@cfg(feature = "secure")
+pub function ftps_close_session(sess)
+    if sess is null
+        return
+    end
+    if sess["tls"] is not null
+        ftps_send_cmd(sess, "QUIT")
+        tls::close(sess["tls"])
+        sess["tls"] = null
+    else
+        if sess["sock"] >= 0
+            net::tcp_close(sess["sock"])
+        end
+    end
+    sess["sock"] = -1
+end
+
+## Opens an FTPS passive data connection (PASV + dial + TLS upgrade).
+@cfg(feature = "secure")
+pub function ftps_open_data_passive(sess, host: string, port: int, cfg: TransferConfig) -> map
+    let res = { "ok": 0, "sock": -1, "tls": null, "error": "" }
+    let pasv_resp: FtpResponse = ftps_send_cmd(sess, "PASV")
+    if pasv_resp.code != 227
+        res["error"] = "FTP PASV failed [" + str(pasv_resp.code) + "]: " + pasv_resp.message
+        return res
+    end
+    let pasv_info = ftp_parse_pasv(pasv_resp.message)
+    if pasv_info["valid"] != 1
+        res["error"] = "Failed to parse FTP PASV coordinates"
+        return res
+    end
+    let data_sock: int = -1
+    try
+        data_sock = net::tcp_connect(pasv_info["ip"], pasv_info["port"])
+    catch e
+        res["error"] = "Failed to connect to FTP data socket " + pasv_info["ip"] + ":" + str(pasv_info["port"])
+        return res
+    end
+    if data_sock < 0
+        res["error"] = "Failed to connect to FTP data socket " + pasv_info["ip"] + ":" + str(pasv_info["port"])
+        return res
+    end
+    net::tcp_set_timeout(data_sock, cfg.timeout_ms)
+    let up_err = { "message": "" }
+    let up = ftps_upgrade_socket(data_sock, host, port, cfg, up_err)
+    if up["ctx"] is null
+        res["error"] = "FTPS data upgrade failed: " + str(up["error"])
+        net::tcp_close(data_sock)
+        return res
+    end
+    res["ok"] = 1
+    res["sock"] = data_sock
+    res["tls"] = up["ctx"]
+    return res
+end
+
+## Explicit-FTPS download with retry and optional resume.
+@cfg(feature = "secure")
+pub function ftps_download_file(host: string, port: int, user: string, pass: string, remote_path: string, local_path: string, cfg: TransferConfig = null, on_progress = null) -> TransferResult
+    let use_cfg: TransferConfig = cfg
+    if use_cfg is null
+        use_cfg = make_config()
+    end
+    let attempts: int = retry_max_attempts(use_cfg)
+    let attempt: int = 0
+    let last: TransferResult = error_result(local_path, "No attempts made")
+    while attempt < attempts
+        last = ftps_download_once(host, port, user, pass, remote_path, local_path, use_cfg, on_progress)
+        if last.is_ok() == 1
+            return last
+        end
+        if ftp_retryable_error(last.error_message) == 0
+            return last
+        end
+        attempt += 1
+        if attempt < attempts
+            let wait_ms: int = retry_backoff_ms(use_cfg, attempt)
+            if wait_ms > 0
+                sleep(wait_ms)
+            end
+        end
+    end
+    return last
+end
+
+## Single explicit-FTPS download attempt.
+@cfg(feature = "secure")
+pub function ftps_download_once(host: string, port: int, user: string, pass: string, remote_path: string, local_path: string, cfg: TransferConfig, on_progress = null) -> TransferResult
+    let op_start_ms: int = clock_ms()
+    if cfg.ftp_mode == 1
+        return error_result(local_path, "FTPS active mode is not supported (use passive PASV)", 0, clock_ms() - op_start_ms)
+    end
+    let ctrl_sock: int = -1
+    try
+        ctrl_sock = net::tcp_connect(host, port)
+    catch e
+        return error_result(local_path, "FTP control connection failed to " + host + ":" + str(port), 0, clock_ms() - op_start_ms)
+    end
+    if ctrl_sock < 0
+        return error_result(local_path, "FTP connection refused: " + host + ":" + str(port), 0, clock_ms() - op_start_ms)
+    end
+    net::tcp_set_timeout(ctrl_sock, cfg.timeout_ms)
+
+    let sess = ftps_login_session(ctrl_sock, host, port, user, pass, cfg)
+    if sess["ok"] == 0
+        return error_result(local_path, str(sess["error"]), 0, clock_ms() - op_start_ms)
+    end
+
+    let offset: int = 0
+    if cfg.resumable == 1 and file_exists(local_path) == true
+        offset = file_size(local_path)
+    else
+        write_file(local_path, "")
+    end
+
+    let data = ftps_open_data_passive(sess, host, port, cfg)
+    if data["ok"] == 0
+        let msg: string = str(data["error"])
+        ftps_close_session(sess)
+        return error_result(local_path, msg, 0, clock_ms() - op_start_ms)
+    end
+
+    if offset > 0
+        let rest_resp: FtpResponse = ftps_send_cmd(sess, "REST", str(offset))
+        if rest_resp.code != 350
+            offset = 0
+            write_file(local_path, "")
+        end
+    end
+    let retr_resp: FtpResponse = ftps_send_cmd(sess, "RETR", remote_path)
+    if retr_resp.code != 150 and retr_resp.code != 125
+        tls::close(data["tls"])
+        ftps_close_session(sess)
+        return error_result(local_path, "FTP RETR failed [" + str(retr_resp.code) + "]: " + retr_resp.message, offset, clock_ms() - op_start_ms)
+    end
+
+    let tracker = progress_tracker_new(-1, clock_ms())
+    tracker.bytes_transferred = offset
+    let throttle = throttle_new(cfg.rate_limit_bps, clock_ms())
+    let transferred: int = offset
+
+    let receiving: int = 1
+    while receiving == 1
+        let piece = tls::tls_recv_encrypted(data["tls"])
+        if piece is null or len(piece) == 0
+            receiving = 0
+            break
+        end
+        # TLS payload size is server-determined: always write the full chunk.
+        let chunk: string = https_bytes_to_str(piece)
+        append_file(local_path, chunk)
+        transferred += len(chunk)
+        if on_progress is not null
+            let prog = progress_update(tracker, transferred, clock_ms())
+            on_progress(prog)
+        end
+        throttle_wait(throttle, len(chunk))
+    end
+
+    tls::close(data["tls"])
+    let done_line: string = ftps_read_line(sess)
+    let done_resp: FtpResponse = ftp_parse_response(done_line)
+    ftps_close_session(sess)
+
+    if done_resp.code != 226 and done_resp.code != 250
+        return error_result(local_path, "FTP transfer incomplete [" + str(done_resp.code) + "]: " + done_resp.message, transferred, clock_ms() - op_start_ms)
+    end
+    return ok_result(local_path, transferred, -1, "", clock_ms() - op_start_ms)
+end
+
+## Explicit-FTPS upload with retry (retries restart from scratch via STOR).
+@cfg(feature = "secure")
+pub function ftps_upload_file(host: string, port: int, user: string, pass: string, local_path: string, remote_path: string, cfg: TransferConfig = null, on_progress = null) -> TransferResult
+    let use_cfg: TransferConfig = cfg
+    if use_cfg is null
+        use_cfg = make_config()
+    end
+    let attempts: int = retry_max_attempts(use_cfg)
+    let attempt: int = 0
+    let last: TransferResult = error_result(local_path, "No attempts made")
+    while attempt < attempts
+        let force_fresh: int = 0
+        if attempt > 0
+            force_fresh = 1
+        end
+        last = ftps_upload_once(host, port, user, pass, local_path, remote_path, use_cfg, on_progress, force_fresh)
+        if last.is_ok() == 1
+            return last
+        end
+        if ftp_retryable_error(last.error_message) == 0
+            return last
+        end
+        attempt += 1
+        if attempt < attempts
+            let wait_ms: int = retry_backoff_ms(use_cfg, attempt)
+            if wait_ms > 0
+                sleep(wait_ms)
+            end
+        end
+    end
+    return last
+end
+
+## Single explicit-FTPS upload attempt.
+@cfg(feature = "secure")
+pub function ftps_upload_once(host: string, port: int, user: string, pass: string, local_path: string, remote_path: string, cfg: TransferConfig, on_progress = null, force_fresh: int = 0) -> TransferResult
+    if file_exists(local_path) == false
+        return error_result(local_path, "Local file not found: " + local_path)
+    end
+    let op_start_ms: int = clock_ms()
+    if cfg.ftp_mode == 1
+        return error_result(local_path, "FTPS active mode is not supported (use passive PASV)", 0, clock_ms() - op_start_ms)
+    end
+
+    let file_bytes: int = file_size(local_path)
+    let content: string = read_file(local_path)
+
+    let ctrl_sock: int = -1
+    try
+        ctrl_sock = net::tcp_connect(host, port)
+    catch e
+        return error_result(local_path, "FTP control connection failed: " + host + ":" + str(port), 0, clock_ms() - op_start_ms)
+    end
+    if ctrl_sock < 0
+        return error_result(local_path, "FTP connection refused: " + host + ":" + str(port), 0, clock_ms() - op_start_ms)
+    end
+    net::tcp_set_timeout(ctrl_sock, cfg.timeout_ms)
+
+    let sess = ftps_login_session(ctrl_sock, host, port, user, pass, cfg)
+    if sess["ok"] == 0
+        return error_result(local_path, str(sess["error"]), 0, clock_ms() - op_start_ms)
+    end
+
+    let data = ftps_open_data_passive(sess, host, port, cfg)
+    if data["ok"] == 0
+        let msg: string = str(data["error"])
+        ftps_close_session(sess)
+        return error_result(local_path, msg, 0, clock_ms() - op_start_ms)
+    end
+
+    let cmd = "STOR"
+    if cfg.resumable == 1 and force_fresh == 0
+        cmd = "APPE"
+    end
+    let stor_resp = ftps_send_cmd(sess, cmd, remote_path)
+    if stor_resp.code != 150 and stor_resp.code != 125
+        tls::close(data["tls"])
+        ftps_close_session(sess)
+        return error_result(local_path, "FTP " + cmd + " failed [" + str(stor_resp.code) + "]: " + stor_resp.message, 0, clock_ms() - op_start_ms)
+    end
+
+    let send_size: int = cfg.chunk_size
+    if send_size <= 0
+        send_size = 65536
+    end
+    let tracker = progress_tracker_new(file_bytes, clock_ms())
+    let throttle = throttle_new(cfg.rate_limit_bps, clock_ms())
+    let sent: int = 0
+
+    while sent < file_bytes
+        let end_idx: int = sent + send_size
+        if end_idx > file_bytes
+            end_idx = file_bytes
+        end
+        let chunk = slice(content, sent, end_idx)
+        if tls::tls_send_encrypted(data["tls"], https_str_to_bytes(chunk)) < 0
+            tls::close(data["tls"])
+            ftps_close_session(sess)
+            return error_result(local_path, "TLS send failed to " + host + ":" + str(port), sent, clock_ms() - op_start_ms)
+        end
+        sent = end_idx
+        if on_progress is not null
+            let prog = progress_update(tracker, sent, clock_ms())
+            on_progress(prog)
+        end
+        throttle_wait(throttle, len(chunk))
+    end
+
+    tls::close(data["tls"])
+    let done_line = ftps_read_line(sess)
+    let done_resp = ftp_parse_response(done_line)
+    ftps_close_session(sess)
+
+    if done_resp.code != 226 and done_resp.code != 250
+        return error_result(local_path, "FTP upload incomplete [" + str(done_resp.code) + "]: " + done_resp.message, sent, clock_ms() - op_start_ms)
+    end
     return ok_result(local_path, sent, file_bytes, "", clock_ms() - op_start_ms)
 end

@@ -118,6 +118,44 @@ pub function TransferBuilder.on_progress(self: TransferBuilder, callback) -> Tra
     return self
 end
 
+## Sets the FTP data connection mode (0 = passive PASV, 1 = active PORT).
+pub function TransferBuilder.ftp_mode(self: TransferBuilder, mode: int) -> TransferBuilder
+    if mode == 1
+        self.config.ftp_mode = 1
+    else
+        self.config.ftp_mode = 0
+    end
+    return self
+end
+
+## Enables (1) or disables (0) explicit FTPS (AUTH TLS) for FTP transfers.
+pub function TransferBuilder.ftps(self: TransferBuilder, enabled: int) -> TransferBuilder
+    if enabled == 1
+        self.config.ftps = 1
+    else
+        self.config.ftps = 0
+    end
+    return self
+end
+
+## Enables (1) or disables (0) TLS certificate verification for HTTPS/FTPS.
+pub function TransferBuilder.tls_verify(self: TransferBuilder, enabled: int) -> TransferBuilder
+    if enabled == 0
+        self.config.tls_verify = 0
+    else
+        self.config.tls_verify = 1
+    end
+    return self
+end
+
+## Configures FTP active mode with the address the server must connect back to.
+pub function TransferBuilder.ftp_active(self: TransferBuilder, ip: string, port: int) -> TransferBuilder
+    self.config.ftp_mode = 1
+    self.config.ftp_active_ip = ip
+    self.config.ftp_active_port = port
+    return self
+end
+
 ## Executes the configured transfer job and returns the final `TransferResult`.
 pub function TransferBuilder.execute(self: TransferBuilder) -> TransferResult
     let parsed = parse_transfer_url(self.url)
@@ -142,14 +180,25 @@ pub function TransferBuilder.execute(self: TransferBuilder) -> TransferResult
             pass = "guest"
         end
 
+        if self.config.ftps == 1
+            if self.mode == TransferMode.Download
+                return ftps_download_file(host, port, user, pass, parsed["path"], self.file_path, self.config, self.progress_callback)
+            else
+                return ftps_upload_file(host, port, user, pass, self.file_path, parsed["path"], self.config, self.progress_callback)
+            end
+        end
+
         if self.mode == TransferMode.Download
-            return ftp_download_file(host, port, user, pass, parsed["path"], self.file_path, self.config.resumable, self.progress_callback, self.config.rate_limit_bps, self.config.chunk_size)
+            return ftp_download_file(host, port, user, pass, parsed["path"], self.file_path, self.config, self.progress_callback)
         else
-            return ftp_upload_file(host, port, user, pass, self.file_path, parsed["path"], self.config.resumable, self.progress_callback, self.config.rate_limit_bps, self.config.chunk_size)
+            return ftp_upload_file(host, port, user, pass, self.file_path, parsed["path"], self.config, self.progress_callback)
         end
     end
 
     # HTTP / HTTPS / Default transfer
+    if scheme == "sftp"
+        return error_result(self.file_path, "SFTP URLs need an SSH transport: use sftp_download_file/sftp_upload_file with channel callbacks")
+    end
     if self.mode == TransferMode.Download
         return http_transfer_download(self.url, self.file_path, self.config, self.progress_callback)
     else

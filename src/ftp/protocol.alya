@@ -74,3 +74,33 @@ pub function ftp_format_command(cmd: string, arg: string = "") -> string
     end
     return cmd + " " + arg + "\r\n"
 end
+
+## Builds a PORT argument "h1,h2,h3,h4,p1,p2" for active mode.
+##
+## Returns "" when the address is not dotted-decimal IPv4 or the port is
+## out of range (callers treat "" as a configuration error).
+pub function ftp_format_port(ip: string, port: int) -> string
+    if port <= 0 or port > 65535
+        return ""
+    end
+    let parts = split_str(trim(ip), ".")
+    if len(parts) != 4
+        return ""
+    end
+    let out: string = ""
+    let i: int = 0
+    while i < 4
+        let oct: int = to_int(trim(parts[i]))
+        if oct < 0 or oct > 255
+            return ""
+        end
+        if i > 0
+            out += ","
+        end
+        out += str(oct)
+        i += 1
+    end
+    let hi: int = port / 256
+    let lo: int = port % 256
+    return out + "," + str(hi) + "," + str(lo)
+end

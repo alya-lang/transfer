@@ -11,9 +11,11 @@ Multi-protocol file transfer toolkit for Alya: HTTP range, resumable downloads a
 
 ## 🌟 Features
 
-- 🌐 **Multi-Protocol Support**: Seamless transfers across HTTP, HTTPS, pure RFC 959 FTP, and SFTP v3 binary wire framing
+- 🌐 **Multi-Protocol Support**: Seamless transfers across HTTP, HTTPS (via the `secure` feature), pure RFC 959 FTP, explicit FTPS (AUTH TLS, `secure` feature), and SFTP v3 session transfers over caller-supplied channels
 - ⏯️ **Resumable Transfers**: Automatic `.transfer_meta` state tracking; resumes interrupted downloads and uploads via RFC 7233 HTTP range requests (`Range: bytes=start-end`) and FTP restart markers (`REST` / `APPE`)
-- ⚡ **Bandwidth Throttling**: Token-bucket rate limiter enforcing configurable transfer speeds (`rate_limit_bps`)
+- 🔁 **Retry with Backoff**: Configurable `max_retries` / `retry_delay_ms` around every engine; only retryable failures (connection drops, timeouts, HTTP 5xx, transient FTP 4xx, truncation) are retried
+- ➡️ **Redirect Following**: Downloads follow up to 5 same- or cross-protocol redirects (auth headers stripped across hosts, query strings preserved); uploads reject redirects with the `Location`
+- ⚡ **Bandwidth Throttling**: Token-bucket rate limiter enforcing configurable transfer speeds (`rate_limit_bps`) on downloads and uploads, HTTP and FTP
 - 🔒 **Integrity & Checksums**: Built-in CRC-32 (IEEE 802.3), MD5 (RFC 1321), and SHA-256 (FIPS 180-4) verification engines
 - 📊 **Real-Time Progress Metrics**: Granular speed (B/s, KB/s, MB/s), ETA calculation, and visual ASCII progress bar rendering
 - 🛠️ **Fluent Builder API**: Ergonomic `TransferBuilder` chaining timeouts, chunk sizes, custom HTTP headers, basic auth, and progress callbacks
@@ -46,13 +48,14 @@ transfer/
 │   │   └── extras.alya     # Feature-gated (`extras`) multipart planning and banners
 │   ├── http/               # HTTP protocol engine
 │   │   ├── range.alya      # RFC 7233 byte-range header formatting and parsing
-│   │   └── client.alya     # Resumable HTTP download and upload socket engines
+│   │   └── client.alya     # Resumable HTTP download/upload engines, retry, redirects, HTTPS (secure feature)
 │   ├── ftp/                # FTP protocol engine
-│   │   ├── protocol.alya   # RFC 959 command framing and PASV coordinate parser
-│   │   └── client.alya     # Control connection, passive data transfer, REST/APPE resume
+│   │   ├── protocol.alya   # RFC 959 command framing, PASV parser, PORT builder
+│   │   └── client.alya     # Passive/active transfers, REST/APPE resume, retry, explicit FTPS (secure feature)
 │   └── sftp/               # SFTP wire protocol
 │       ├── packet.alya     # Big-endian uint32/uint64 binary framing and packing
-│       └── protocol.alya   # SFTP v3 packet encoders (INIT, OPEN, READ, WRITE, CLOSE)
+│       ├── protocol.alya   # SFTP v3 packet encoders/decoders (incl. server replies)
+│       └── client.alya     # Session transfer engine over caller-supplied channels
 ├── examples/
 │   └── demo.alya           # Comprehensive runnable walkthrough of all package capabilities
 ├── tests/
@@ -80,6 +83,29 @@ Or install it directly using the Alya package CLI:
 ```bash
 alya add transfer --git https://github.com/alya-lang/transfer --branch main
 alya install
+```
+
+### 🔒 HTTPS & FTPS (`secure` feature)
+
+TLS transports live behind the opt-in `secure` feature (pulls the `tls` package, which needs a C toolchain). The default build stays dependency-free:
+
+```bash
+alya install --features secure
+alya test --features secure
+```
+
+Then enable per transfer with the defaults (certificates verified):
+
+```alya
+let res = transfer::download("https://example.com/archive.tar.gz", "archive.tar.gz")
+    .rate_limit(1048576)
+    .execute() # verified TLS; use .tls_verify(0) only for local testing
+```
+
+SFTP transfers need an SSH transport, which ships outside this package. Drive the session engine with your own channel callbacks:
+
+```alya
+let res = transfer::sftp_download_file(my_send, my_recv, "/remote/data.bin", "data.bin", cfg, null)
 ```
 
 ---
@@ -124,6 +150,19 @@ main()
 | `upload_file(url, src_path, config, on_progress)` | `pub function` | Direct upload executor returning a `TransferResult`. |
 | `ftp_download(host, port, user, pass, remote_path, local_path, resume, on_progress)` | `pub function` | RFC 959 FTP download with passive data mode and offset restart (`REST`). |
 | `ftp_upload(host, port, user, pass, local_path, remote_path, resume, on_progress)` | `pub function` | RFC 959 FTP upload with passive data mode and append mode (`APPE`). |
+| `ftps_download_file(host, port, user, pass, remote_path, local_path, config, on_progress)` | `pub function` (`secure` feature) | Explicit FTPS download (AUTH TLS + encrypted control/data). |
+| `ftps_upload_file(host, port, user, pass, local_path, remote_path, config, on_progress)` | `pub function` (`secure` feature) | Explicit FTPS upload (AUTH TLS + encrypted control/data). |
+| `https_transfer_download(url, dest_path, config, on_progress, max_hops)` | `pub function` (`secure` feature) | Resumable HTTPS download with retry and redirect following. |
+| `https_transfer_upload(url, src_path, config, on_progress)` | `pub function` (`secure` feature) | HTTPS upload with retry. |
+| `sftp_download_file(send, recv, remote_path, local_path, config, on_progress)` | `pub function` | SFTP download over caller-supplied channel callbacks. |
+| `sftp_upload_file(send, recv, local_path, remote_path, config, on_progress)` | `pub function` | SFTP upload over caller-supplied channel callbacks. |
+| `sftp_session_open(send, recv)` | `pub function` | SFTP INIT/VERSION handshake over channel callbacks. |
+| `resolve_redirect_url(base_url, location)` | `pub function` | Resolves a redirect `Location` against the requesting URL. |
+| `http_is_redirect(code)` | `pub function` | Returns 1 for redirect statuses (301/302/303/307/308). |
+| `http_retryable_error(msg)` / `ftp_retryable_error(msg)` | `pub function` | Classify transfer errors as retryable (1) or fatal (0). |
+| `retry_max_attempts(config)` / `retry_backoff_ms(config, attempt)` | `pub function` | Attempt budget (`max_retries + 1`) and linear backoff delay. |
+| `ftp_format_port(ip, port)` | `pub function` | Builds a PORT argument for FTP active mode. |
+| `throttle_wait(throttle, chunk_size)` | `pub function` | Accounts a chunk and sleeps when the rate cap is exceeded. |
 | `new_config(timeout_ms, chunk_size, max_retries, rate_limit_bps, resumable)` | `pub function` | Factory constructing a `TransferConfig` with sensible defaults. |
 | `new_progress(bytes_transferred, total_bytes, speed_bps)` | `pub function` | Factory constructing a `TransferProgress` snapshot. |
 | `crc32(data)` | `pub function` | Computes the CRC-32 IEEE 802.3 checksum string of data. |
@@ -133,7 +172,7 @@ main()
 | `plan_multipart_chunks(total_bytes, chunk_count)` | `pub function` (`extras` feature) | Partitions byte ranges for parallel multi-part transfers. |
 | `format_transfer_banner(title)` | `pub function` (`extras` feature) | Renders formatted ASCII banner for CLI transfer tools. |
 | `TransferBuilder` | `pub struct` | Fluent builder with chained configuration setters and `execute()`. |
-| `TransferConfig` | `pub struct` | Configuration parameters (`timeout_ms`, `chunk_size`, `rate_limit_bps`, `resumable`, etc.). |
+| `TransferConfig` | `pub struct` | Configuration parameters (`timeout_ms`, `chunk_size`, `rate_limit_bps`, `resumable`, `max_retries`, `retry_delay_ms`, `ftp_mode`, `ftps`, `tls_verify`, etc.). |
 | `TransferProgress` | `pub struct` | Real-time transfer metrics with `render_bar()`, `summary()`, and `is_complete()`. |
 | `TransferResult` | `pub struct` | Operation outcome with `is_ok()`, `is_error()`, and `summary()`. |
 | `ResumeMeta` | `pub struct` | Persistent resume metadata token (`.transfer_meta`) container. |
@@ -162,6 +201,13 @@ Exercise feature selection (the `extras` slice is default-on):
 ```bash
 alya test --features extras
 alya test --no-default-features
+```
+
+Exercise the TLS transports (needs a C toolchain for the `tls` dependency):
+
+```bash
+alya install --features secure
+alya test --features secure
 ```
 
 Generate static API documentation:

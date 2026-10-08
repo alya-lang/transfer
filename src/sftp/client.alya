@@ -1,0 +1,269 @@
+## SFTP Session Transfer Engine (v3)
+##
+## Part of the Alya Language package ecosystem (https://github.com/alya-lang).
+## Client-side SFTP session logic over caller-supplied channel callbacks:
+## INIT/VERSION handshake, OPEN/READ/WRITE/CLOSE chunk loops with resume
+## offsets, throttling, and progress reporting.
+##
+## Transport-agnostic by design: `send` delivers one `SftpPacket` and
+## `recv` returns the next reply packet (or null when the channel closes).
+## Any SSH transport (subsystem channel) can plug in; the loopback tests
+## drive the engine with an in-memory fake server.
+
+import "../types.alya"
+import "../core/progress.alya"
+import "../core/throttle.alya"
+import "./packet.alya"
+import "./protocol.alya"
+
+# ───────────────────────────────────────────────────────────────
+# Session Primitives
+# ───────────────────────────────────────────────────────────────
+
+## Performs the INIT/VERSION handshake. Result map: ok/version/error.
+pub function sftp_session_open(chan_send, chan_recv) -> map
+    let res = { "ok": 0, "version": -1, "error": "" }
+    chan_send(sftp_build_init(3))
+    let resp = chan_recv()
+    if resp is null
+        res["error"] = "SFTP transport closed during handshake"
+        return res
+    end
+    let ver: int = sftp_parse_version(resp)
+    if ver < 0
+        res["error"] = "SFTP handshake failed: expected VERSION reply"
+        return res
+    end
+    res["ok"] = 1
+    res["version"] = ver
+    return res
+end
+
+## Opens a remote path and returns its handle. Result map: ok/handle/error.
+pub function sftp_open_handle(chan_send, chan_recv, request_id: int, path: string, flags: int) -> map
+    let res = { "ok": 0, "handle": "", "error": "" }
+    chan_send(sftp_build_open(request_id, path, flags))
+    let resp = chan_recv()
+    if resp is null
+        res["error"] = "SFTP transport closed during OPEN"
+        return res
+    end
+    if resp.packet_type == SftpType.Handle
+        res["ok"] = 1
+        res["handle"] = sftp_parse_handle(resp)
+        return res
+    end
+    let st = sftp_parse_status(resp)
+    res["error"] = "SFTP open failed [" + str(st["code"]) + "]: " + st["message"]
+    return res
+end
+
+## Reads one chunk at `offset`. Result map: ok/data/eof/error.
+##
+## A STATUS reply with `Eof` ends the stream cleanly (`eof = 1`); any other
+## STATUS is a failure.
+pub function sftp_read_chunk(chan_send, chan_recv, request_id: int, handle: string, offset: int, length: int) -> map
+    let res = { "ok": 0, "data": "", "eof": 0, "error": "" }
+    chan_send(sftp_build_read(request_id, handle, offset, length))
+    let resp = chan_recv()
+    if resp is null
+        res["error"] = "SFTP transport closed during READ"
+        return res
+    end
+    if resp.packet_type == SftpType.Data
+        res["ok"] = 1
+        res["data"] = sftp_parse_data(resp)
+        return res
+    end
+    let st = sftp_parse_status(resp)
+    if st["code"] == SftpStatus.Eof
+        res["ok"] = 1
+        res["eof"] = 1
+        return res
+    end
+    res["error"] = "SFTP read failed [" + str(st["code"]) + "]: " + st["message"]
+    return res
+end
+
+## Writes one chunk at `offset`. Result map: ok/error (STATUS Ok required).
+pub function sftp_write_chunk(chan_send, chan_recv, request_id: int, handle: string, offset: int, data: string) -> map
+    let res = { "ok": 0, "error": "" }
+    chan_send(sftp_build_write(request_id, handle, offset, data))
+    let resp = chan_recv()
+    if resp is null
+        res["error"] = "SFTP transport closed during WRITE"
+        return res
+    end
+    let st = sftp_parse_status(resp)
+    if st["code"] == SftpStatus.Ok
+        res["ok"] = 1
+        return res
+    end
+    res["error"] = "SFTP write failed [" + str(st["code"]) + "]: " + st["message"]
+    return res
+end
+
+## Closes a remote handle (best effort). Result map: ok/error.
+pub function sftp_close_handle(chan_send, chan_recv, request_id: int, handle: string) -> map
+    let res = { "ok": 0, "error": "" }
+    chan_send(sftp_build_close(request_id, handle))
+    let resp = chan_recv()
+    if resp is null
+        res["error"] = "SFTP transport closed during CLOSE"
+        return res
+    end
+    let st = sftp_parse_status(resp)
+    if st["code"] == SftpStatus.Ok
+        res["ok"] = 1
+        return res
+    end
+    res["error"] = "SFTP close failed [" + str(st["code"]) + "]: " + st["message"]
+    return res
+end
+
+# ───────────────────────────────────────────────────────────────
+# File Download / Upload
+# ───────────────────────────────────────────────────────────────
+
+## Downloads a remote path to a local file over an SFTP session.
+##
+## Resumes from the partial local file when `cfg.resumable` is set (READ
+## offsets continue at the existing size). Retries are the caller's job:
+## re-calling resumes idempotently from the partial file.
+pub function sftp_download_file(chan_send, chan_recv, remote_path: string, local_path: string, cfg: TransferConfig = null, on_progress = null) -> TransferResult
+    let use_cfg: TransferConfig = cfg
+    if use_cfg is null
+        use_cfg = make_config()
+    end
+    let op_start_ms: int = clock_ms()
+
+    let hs = sftp_session_open(chan_send, chan_recv)
+    if hs["ok"] == 0
+        return error_result(local_path, str(hs["error"]), 0, clock_ms() - op_start_ms)
+    end
+
+    let req_id: int = 1
+    let oh = sftp_open_handle(chan_send, chan_recv, req_id, remote_path, SftpOpenFlags.Read)
+    req_id += 1
+    if oh["ok"] == 0
+        return error_result(local_path, str(oh["error"]), 0, clock_ms() - op_start_ms)
+    end
+    let handle: string = oh["handle"]
+
+    let offset: int = 0
+    if use_cfg.resumable == 1 and file_exists(local_path) == true
+        if use_cfg.overwrite == 0
+            offset = file_size(local_path)
+        else
+            write_file(local_path, "")
+        end
+    else
+        write_file(local_path, "")
+    end
+
+    let read_len: int = use_cfg.chunk_size
+    if read_len <= 0
+        read_len = 32768
+    end
+    if read_len > 32768
+        read_len = 32768
+    end
+
+    let tracker = progress_tracker_new(-1, clock_ms())
+    tracker.bytes_transferred = offset
+    let throttle = throttle_new(use_cfg.rate_limit_bps, clock_ms())
+    let transferred: int = offset
+
+    let active: int = 1
+    while active == 1
+        let rc = sftp_read_chunk(chan_send, chan_recv, req_id, handle, transferred, read_len)
+        req_id += 1
+        if rc["ok"] == 0
+            sftp_close_handle(chan_send, chan_recv, req_id, handle)
+            return error_result(local_path, str(rc["error"]), transferred, clock_ms() - op_start_ms)
+        end
+        if rc["eof"] == 1
+            active = 0
+            break
+        end
+        let piece: string = rc["data"]
+        if len(piece) == 0
+            active = 0
+            break
+        end
+        append_file(local_path, piece)
+        transferred += len(piece)
+        if on_progress is not null
+            let prog = progress_update(tracker, transferred, clock_ms())
+            on_progress(prog)
+        end
+        throttle_wait(throttle, len(piece))
+    end
+
+    sftp_close_handle(chan_send, chan_recv, req_id, handle)
+    return ok_result(local_path, transferred, transferred, "", clock_ms() - op_start_ms)
+end
+
+## Uploads a local file to a remote path over an SFTP session.
+pub function sftp_upload_file(chan_send, chan_recv, local_path: string, remote_path: string, cfg: TransferConfig = null, on_progress = null) -> TransferResult
+    if file_exists(local_path) == false
+        return error_result(local_path, "Local file not found: " + local_path)
+    end
+    let use_cfg: TransferConfig = cfg
+    if use_cfg is null
+        use_cfg = make_config()
+    end
+    let op_start_ms: int = clock_ms()
+
+    let hs = sftp_session_open(chan_send, chan_recv)
+    if hs["ok"] == 0
+        return error_result(local_path, str(hs["error"]), 0, clock_ms() - op_start_ms)
+    end
+
+    let req_id: int = 1
+    let flags: int = SftpOpenFlags.Write + SftpOpenFlags.Create + SftpOpenFlags.Truncate
+    let oh = sftp_open_handle(chan_send, chan_recv, req_id, remote_path, flags)
+    req_id += 1
+    if oh["ok"] == 0
+        return error_result(local_path, str(oh["error"]), 0, clock_ms() - op_start_ms)
+    end
+    let handle: string = oh["handle"]
+
+    let file_bytes: int = file_size(local_path)
+    let content: string = read_file(local_path)
+
+    let write_len: int = use_cfg.chunk_size
+    if write_len <= 0
+        write_len = 32768
+    end
+    if write_len > 32768
+        write_len = 32768
+    end
+
+    let tracker = progress_tracker_new(file_bytes, clock_ms())
+    let throttle = throttle_new(use_cfg.rate_limit_bps, clock_ms())
+    let sent: int = 0
+
+    while sent < file_bytes
+        let end_idx: int = sent + write_len
+        if end_idx > file_bytes
+            end_idx = file_bytes
+        end
+        let chunk = slice(content, sent, end_idx)
+        let wc = sftp_write_chunk(chan_send, chan_recv, req_id, handle, sent, chunk)
+        req_id += 1
+        if wc["ok"] == 0
+            sftp_close_handle(chan_send, chan_recv, req_id, handle)
+            return error_result(local_path, str(wc["error"]), sent, clock_ms() - op_start_ms)
+        end
+        sent = end_idx
+        if on_progress is not null
+            let prog = progress_update(tracker, sent, clock_ms())
+            on_progress(prog)
+        end
+        throttle_wait(throttle, len(chunk))
+    end
+
+    sftp_close_handle(chan_send, chan_recv, req_id, handle)
+    return ok_result(local_path, sent, file_bytes, "", clock_ms() - op_start_ms)
+end
