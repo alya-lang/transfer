@@ -1,0 +1,154 @@
+## Fluent Transfer Builder API
+##
+## Part of the Alya Language package ecosystem (https://github.com/alya-lang).
+## Provides an ergonomic, chainable builder interface to configure, execute,
+## and monitor multi-protocol file transfers.
+
+import "./types.alya"
+import "./core/url.alya"
+import "./http/client.alya"
+import "./ftp/client.alya"
+
+## Fluent builder for configuring and executing download and upload jobs.
+pub struct TransferBuilder
+    mode: int,
+    url: string,
+    file_path: string,
+    config: TransferConfig,
+    progress_callback
+end
+
+## Creates a new download builder targeting a destination file path.
+pub function download_builder(url: string, dest_path: string) -> TransferBuilder
+    return TransferBuilder {
+        mode: TransferMode.Download,
+        url: url,
+        file_path: dest_path,
+        config: make_config(),
+        progress_callback: null
+    }
+end
+
+## Creates a new upload builder sourcing data from a local file path.
+pub function upload_builder(url: string, src_path: string) -> TransferBuilder
+    return TransferBuilder {
+        mode: TransferMode.Upload,
+        url: url,
+        file_path: src_path,
+        config: make_config(),
+        progress_callback: null
+    }
+end
+
+# ───────────────────────────────────────────────────────────────
+# Struct Methods: TransferBuilder
+# ───────────────────────────────────────────────────────────────
+
+## Sets the connection and transfer timeout in milliseconds.
+pub function TransferBuilder.timeout(self: TransferBuilder, ms: int) -> TransferBuilder
+    self.config.timeout_ms = ms
+    return self
+end
+
+## Sets the streaming chunk buffer size in bytes.
+pub function TransferBuilder.chunk_size(self: TransferBuilder, size: int) -> TransferBuilder
+    self.config.chunk_size = size
+    return self
+end
+
+## Sets the bandwidth throttle rate limit in bytes per second (0 = unlimited).
+pub function TransferBuilder.rate_limit(self: TransferBuilder, bps: int) -> TransferBuilder
+    self.config.rate_limit_bps = bps
+    return self
+end
+
+## Configures whether the transfer should be resumable from interrupted offsets.
+pub function TransferBuilder.resumable(self: TransferBuilder, enabled: int = 1) -> TransferBuilder
+    self.config.resumable = enabled
+    return self
+end
+
+## Configures whether existing destination files should be overwritten.
+pub function TransferBuilder.overwrite(self: TransferBuilder, enabled: int = 1) -> TransferBuilder
+    self.config.overwrite = enabled
+    return self
+end
+
+## Configures authentication credentials.
+pub function TransferBuilder.auth(self: TransferBuilder, user: string, pass: string) -> TransferBuilder
+    self.config.auth_user = user
+    self.config.auth_pass = pass
+    return self
+end
+
+## Adds a custom request header to the transfer configuration.
+pub function TransferBuilder.header(self: TransferBuilder, key: string, val: string) -> TransferBuilder
+    self.config.headers[key] = val
+    return self
+end
+
+## Sets expected CRC-32 checksum to verify upon transfer completion.
+pub function TransferBuilder.verify_crc32(self: TransferBuilder, expected_hex: string) -> TransferBuilder
+    self.config.checksum_algo = ChecksumAlgo.Crc32
+    self.config.expected_checksum = expected_hex
+    return self
+end
+
+## Sets expected MD5 digest to verify upon transfer completion.
+pub function TransferBuilder.verify_md5(self: TransferBuilder, expected_hex: string) -> TransferBuilder
+    self.config.checksum_algo = ChecksumAlgo.Md5
+    self.config.expected_checksum = expected_hex
+    return self
+end
+
+## Sets expected SHA-256 digest to verify upon transfer completion.
+pub function TransferBuilder.verify_sha256(self: TransferBuilder, expected_hex: string) -> TransferBuilder
+    self.config.checksum_algo = ChecksumAlgo.Sha256
+    self.config.expected_checksum = expected_hex
+    return self
+end
+
+## Attaches a live progress reporting callback function.
+pub function TransferBuilder.on_progress(self: TransferBuilder, callback) -> TransferBuilder
+    self.progress_callback = callback
+    return self
+end
+
+## Executes the configured transfer job and returns the final `TransferResult`.
+pub function TransferBuilder.execute(self: TransferBuilder) -> TransferResult
+    let parsed = parse_transfer_url(self.url)
+    let scheme: string = parsed["scheme"]
+
+    if scheme == "ftp"
+        let host: string = parsed["host"]
+        let port: int = parsed["port"]
+        let user: string = self.config.auth_user
+        if user == "" and parsed["user"] != ""
+            user = parsed["user"]
+        end
+        if user == ""
+            user = "anonymous"
+        end
+
+        let pass: string = self.config.auth_pass
+        if pass == "" and parsed["pass"] != ""
+            pass = parsed["pass"]
+        end
+        if pass == ""
+            pass = "guest"
+        end
+
+        if self.mode == TransferMode.Download
+            return ftp_download_file(host, port, user, pass, parsed["path"], self.file_path, self.config.resumable, self.progress_callback)
+        else
+            return ftp_upload_file(host, port, user, pass, self.file_path, parsed["path"], self.config.resumable, self.progress_callback)
+        end
+    end
+
+    # HTTP / HTTPS / Default transfer
+    if self.mode == TransferMode.Download
+        return http_transfer_download(self.url, self.file_path, self.config, self.progress_callback)
+    else
+        return http_transfer_upload(self.url, self.file_path, self.config, self.progress_callback)
+    end
+end

@@ -1,0 +1,48 @@
+## Bandwidth Throttling & Rate Limiting
+##
+## Part of the Alya Language package ecosystem (https://github.com/alya-lang).
+## Provides token-bucket and window-based rate limiting to cap maximum
+## bandwidth usage during download and upload operations.
+
+## Throttle state container.
+pub struct Throttle
+    rate_limit_bps: int,
+    bytes_in_window: int,
+    window_start_ms: int
+end
+
+## Creates a new `Throttle` instance with given bytes-per-second limit (0 = unlimited).
+pub function throttle_new(rate_limit_bps: int = 0, current_time_ms: int = 0) -> Throttle
+    return Throttle {
+        rate_limit_bps: rate_limit_bps,
+        bytes_in_window: 0,
+        window_start_ms: current_time_ms
+    }
+end
+
+## Evaluates whether bandwidth cap is exceeded and returns required sleep delay in ms.
+pub function throttle_delay_ms(throttle: Throttle, chunk_size: int, current_time_ms: int) -> int
+    if throttle.rate_limit_bps <= 0
+        return 0
+    end
+
+    throttle.bytes_in_window += chunk_size
+    let elapsed: int = current_time_ms - throttle.window_start_ms
+
+    if elapsed >= 1000
+        # Reset window after 1 second
+        throttle.bytes_in_window = chunk_size
+        throttle.window_start_ms = current_time_ms
+        return 0
+    end
+
+    # If bytes in current window exceed rate limit, calculate needed delay
+    if throttle.bytes_in_window > throttle.rate_limit_bps
+        let expected_ms: int = (throttle.bytes_in_window * 1000) / throttle.rate_limit_bps
+        let delay_needed: int = expected_ms - elapsed
+        if delay_needed > 0
+            return delay_needed
+        end
+    end
+    return 0
+end

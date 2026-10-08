@@ -1,28 +1,57 @@
 ## transfer Optional Extras Module (feature-gated)
 ##
 ## Part of the Alya Language package ecosystem (https://github.com/alya-lang).
-## Demonstrates feature-gated API slices: this module is only compiled when
-## the `extras` feature is active (see `[features]` in `alya.toml`). Gate
-## imports and items with `@cfg(feature = "...")` and keep a
-## `@cfg(not(feature = "..."))` fallback stub in `src/lib.alya` so callers
-## get a clear descriptive error instead of an undefined reference.
+## Advanced transfer utilities, multipart chunk planning, and diagnostic tools.
 
-## Returns an enthusiastic greeting for the specified recipient.
-##
-## Only available when the `extras` feature is active (default-on). Without
-## it, the fallback stub in `src/lib.alya` throws a descriptive error.
+## Computes byte offset ranges for dividing a file into N balanced multipart chunks.
 ##
 ## ### Parameters
-## - `name`: The recipient name string. Defaults to `"World"`.
+## - `total_bytes`: Total byte size of the target file.
+## - `chunk_count`: Desired number of parallel/sequential chunks (>= 1).
 ##
 ## ### Returns
-## The greeting string `"Howdy, {name}!"`.
-##
-## ### Examples
-## ```alya
-## let msg = extra_greeting("Alya") # "Howdy, Alya!"
-## ```
+## Array of chunk maps, each containing: `index`, `start`, `end`, `size`.
 @cfg(feature = "extras")
-pub function extra_greeting(name = "World") -> string
-    return "Howdy, {name}!"
+pub function plan_multipart_chunks(total_bytes: int, chunk_count: int = 4) -> array
+    let chunks = []
+    if total_bytes <= 0 or chunk_count <= 0
+        return chunks
+    end
+
+    let count: int = chunk_count
+    if count > total_bytes
+        count = total_bytes
+    end
+
+    let base_chunk_size: int = total_bytes / count
+    let remainder: int = total_bytes % count
+
+    let current_offset: int = 0
+    let i: int = 0
+    while i < count
+        let this_size: int = base_chunk_size
+        if i == count - 1
+            this_size += remainder
+        end
+        let end_offset: int = current_offset + this_size - 1
+
+        chunks.push({
+            "index": i,
+            "start": current_offset,
+            "end": end_offset,
+            "size": this_size
+        })
+
+        current_offset += this_size
+        i += 1
+    end
+
+    return chunks
+end
+
+## Generates a decorative terminal banner for file transfer operations.
+@cfg(feature = "extras")
+pub function format_transfer_banner(title: string) -> string
+    let line: string = "════════════════════════════════════════════════════════════"
+    return line + "\n  " + title + "\n" + line
 end

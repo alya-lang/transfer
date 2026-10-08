@@ -1,0 +1,306 @@
+## Pure RFC 959 FTP Client Engine
+##
+## Part of the Alya Language package ecosystem (https://github.com/alya-lang).
+## High-level FTP client supporting binary transfers, passive mode data sockets,
+## restart markers (REST) for resumable downloads/uploads, and progress reporting.
+
+import "std/net" as net
+import "../types.alya"
+import "../core/str_util.alya"
+import "../core/progress.alya"
+import "../core/throttle.alya"
+import "../core/resume.alya"
+import "./protocol.alya"
+
+# ───────────────────────────────────────────────────────────────
+# Low-Level FTP Control Socket I/O
+# ───────────────────────────────────────────────────────────────
+
+## Reads a single CRLF-terminated response line from an FTP control socket.
+pub function ftp_read_line(sock: int) -> string
+    let line: string = ""
+    let reading: int = 1
+    while reading == 1
+        let ch: string = net::tcp_recv(sock, 1)
+        if ch == ""
+            reading = 0
+            break
+        end
+        line += ch
+        if str_has_suffix(line, "\r\n") == 1
+            reading = 0
+            break
+        end
+    end
+    return line
+end
+
+## Sends an FTP command on the control socket and reads the server's reply.
+pub function ftp_send_cmd(sock: int, cmd: string, arg: string = "") -> FtpResponse
+    let wire: string = ftp_format_command(cmd, arg)
+    net::tcp_send(sock, wire)
+
+    let line: string = ftp_read_line(sock)
+    let resp: FtpResponse = ftp_parse_response(line)
+
+    # Handle multi-line responses (e.g. 220- banner)
+    if len(line) >= 4 and char_at(line, 3) == "-"
+        let cont_prefix: string = slice(line, 0, 3) + " "
+        let reading_multi: int = 1
+        while reading_multi == 1
+            let next_line: string = ftp_read_line(sock)
+            if next_line == "" or str_has_prefix(next_line, cont_prefix) == 1
+                resp = ftp_parse_response(next_line)
+                reading_multi = 0
+                break
+            end
+        end
+    end
+
+    return resp
+end
+
+## Authenticates on the FTP control connection with username and password.
+pub function ftp_login(sock: int, user: string = "anonymous", pass: string = "guest") -> FtpResponse
+    let u_resp: FtpResponse = ftp_send_cmd(sock, "USER", user)
+    if u_resp.code == 230
+        return u_resp
+    end
+    if u_resp.code == 331
+        return ftp_send_cmd(sock, "PASS", pass)
+    end
+    return u_resp
+end
+
+## Queries remote file size via the SIZE command. Returns -1 if unsupported.
+pub function ftp_get_file_size(sock: int, remote_path: string) -> int
+    let resp: FtpResponse = ftp_send_cmd(sock, "SIZE", remote_path)
+    if resp.code == 213
+        return to_int(resp.message)
+    end
+    return -1
+end
+
+# ───────────────────────────────────────────────────────────────
+# Resumable FTP Download
+# ───────────────────────────────────────────────────────────────
+
+## Downloads a file from an FTP server with optional offset restart for resume.
+pub function ftp_download_file(host: string, port: int, user: string, pass: string, remote_path: string, local_path: string, resume: int = 0, on_progress = null) -> TransferResult
+    let ctrl_sock: int = -1
+    try
+        ctrl_sock = net::tcp_connect(host, port)
+    catch e
+        return error_result(local_path, "FTP control connection failed to " + host + ":" + str(port))
+    end
+    if ctrl_sock < 0
+        return error_result(local_path, "FTP connection refused: " + host + ":" + str(port))
+    end
+
+    # Read greeting banner
+    let banner: string = ftp_read_line(ctrl_sock)
+    let b_resp: FtpResponse = ftp_parse_response(banner)
+    if b_resp.code != 220
+        net::tcp_close(ctrl_sock)
+        return error_result(local_path, "Unexpected FTP greeting: " + banner)
+    end
+
+    # Authenticate
+    let auth_resp: FtpResponse = ftp_login(ctrl_sock, user, pass)
+    if auth_resp.code != 230
+        net::tcp_close(ctrl_sock)
+        return error_result(local_path, "FTP login failed: " + auth_resp.message)
+    end
+
+    # Set binary transfer mode
+    let type_resp: FtpResponse = ftp_send_cmd(ctrl_sock, "TYPE", "I")
+    if type_resp.code != 200
+        net::tcp_close(ctrl_sock)
+        return error_result(local_path, "FTP TYPE I failed: " + type_resp.message)
+    end
+
+    # Query file size
+    let remote_size: int = ftp_get_file_size(ctrl_sock, remote_path)
+
+    # Check local partial file for resume
+    let offset: int = 0
+    if resume == 1 and file_exists(local_path) == true
+        offset = file_size(local_path)
+    else
+        write_file(local_path, "")
+    end
+
+    # Enter Passive Mode
+    let pasv_resp: FtpResponse = ftp_send_cmd(ctrl_sock, "PASV")
+    if pasv_resp.code != 227
+        net::tcp_close(ctrl_sock)
+        return error_result(local_path, "FTP PASV failed: " + pasv_resp.message)
+    end
+
+    let pasv_info = ftp_parse_pasv(pasv_resp.message)
+    if pasv_info["valid"] != 1
+        net::tcp_close(ctrl_sock)
+        return error_result(local_path, "Failed to parse FTP PASV coordinates")
+    end
+
+    let data_ip: string = pasv_info["ip"]
+    let data_port: int = pasv_info["port"]
+
+    # Connect to passive data socket
+    let data_sock: int = -1
+    try
+        data_sock = net::tcp_connect(data_ip, data_port)
+    catch e
+        net::tcp_close(ctrl_sock)
+        return error_result(local_path, "Failed to connect to FTP data socket " + data_ip + ":" + str(data_port))
+    end
+
+    # If resuming, issue REST command
+    if offset > 0
+        let rest_resp: FtpResponse = ftp_send_cmd(ctrl_sock, "REST", str(offset))
+        if rest_resp.code != 350
+            offset = 0
+            write_file(local_path, "")
+        end
+    end
+
+    # Issue RETR command
+    let retr_resp: FtpResponse = ftp_send_cmd(ctrl_sock, "RETR", remote_path)
+    if retr_resp.code != 150 and retr_resp.code != 125
+        net::tcp_close(data_sock)
+        net::tcp_close(ctrl_sock)
+        return error_result(local_path, "FTP RETR failed: " + retr_resp.message)
+    end
+
+    # Receive data stream from data socket
+    let tracker = progress_tracker_new(remote_size, 0)
+    tracker.bytes_transferred = offset
+    let transferred: int = offset
+
+    let receiving: int = 1
+    while receiving == 1
+        let chunk: string = net::tcp_recv(data_sock, 65536)
+        let clen: int = len(chunk)
+        if clen == 0
+            receiving = 0
+            break
+        end
+
+        append_file(local_path, chunk)
+        transferred += clen
+
+        if on_progress is not null
+            let prog = progress_update(tracker, transferred, 0)
+            on_progress(prog)
+        end
+    end
+
+    net::tcp_close(data_sock)
+
+    # Read transfer complete message on control socket
+    let done_line: string = ftp_read_line(ctrl_sock)
+    let done_resp: FtpResponse = ftp_parse_response(done_line)
+
+    ftp_send_cmd(ctrl_sock, "QUIT")
+    net::tcp_close(ctrl_sock)
+
+    if done_resp.code != 226 and done_resp.code != 250
+        return error_result(local_path, "FTP transfer incomplete: " + done_resp.message, transferred)
+    end
+
+    return ok_result(local_path, transferred, remote_size)
+end
+
+# ───────────────────────────────────────────────────────────────
+# Resumable FTP Upload
+# ───────────────────────────────────────────────────────────────
+
+## Uploads a file to an FTP server with optional append mode for resume.
+pub function ftp_upload_file(host: string, port: int, user: string, pass: string, local_path: string, remote_path: string, resume: int = 0, on_progress = null) -> TransferResult
+    if file_exists(local_path) == false
+        return error_result(local_path, "Local file not found: " + local_path)
+    end
+
+    let file_bytes: int = file_size(local_path)
+    let content: string = read_file(local_path)
+
+    let ctrl_sock: int = -1
+    try
+        ctrl_sock = net::tcp_connect(host, port)
+    catch e
+        return error_result(local_path, "FTP control connection failed: " + host + ":" + str(port))
+    end
+    if ctrl_sock < 0
+        return error_result(local_path, "FTP connection refused: " + host + ":" + str(port))
+    end
+
+    let _banner = ftp_read_line(ctrl_sock)
+    let auth_resp = ftp_login(ctrl_sock, user, pass)
+    if auth_resp.code != 230
+        net::tcp_close(ctrl_sock)
+        return error_result(local_path, "FTP login failed: " + auth_resp.message)
+    end
+
+    ftp_send_cmd(ctrl_sock, "TYPE", "I")
+
+    # Enter Passive Mode
+    let pasv_resp = ftp_send_cmd(ctrl_sock, "PASV")
+    let pasv_info = ftp_parse_pasv(pasv_resp.message)
+    if pasv_info["valid"] != 1
+        net::tcp_close(ctrl_sock)
+        return error_result(local_path, "Failed to parse FTP PASV coordinates")
+    end
+
+    let data_sock: int = -1
+    try
+        data_sock = net::tcp_connect(pasv_info["ip"], pasv_info["port"])
+    catch e
+        net::tcp_close(ctrl_sock)
+        return error_result(local_path, "Failed to connect to FTP data socket")
+    end
+
+    let cmd = "STOR"
+    if resume == 1
+        cmd = "APPE"
+    end
+    let stor_resp = ftp_send_cmd(ctrl_sock, cmd, remote_path)
+    if stor_resp.code != 150 and stor_resp.code != 125
+        net::tcp_close(data_sock)
+        net::tcp_close(ctrl_sock)
+        return error_result(local_path, "FTP " + cmd + " failed: " + stor_resp.message)
+    end
+
+    # Stream content to data socket
+    let tracker = progress_tracker_new(file_bytes, 0)
+    let sent: int = 0
+    let chunk_size: int = 65536
+
+    while sent < file_bytes
+        let end_idx: int = sent + chunk_size
+        if end_idx > file_bytes
+            end_idx = file_bytes
+        end
+        let chunk = slice(content, sent, end_idx)
+        net::tcp_send(data_sock, chunk)
+        sent = end_idx
+
+        if on_progress is not null
+            let prog = progress_update(tracker, sent, 0)
+            on_progress(prog)
+        end
+    end
+
+    net::tcp_close(data_sock)
+
+    let done_line = ftp_read_line(ctrl_sock)
+    let done_resp = ftp_parse_response(done_line)
+
+    ftp_send_cmd(ctrl_sock, "QUIT")
+    net::tcp_close(ctrl_sock)
+
+    if done_resp.code != 226 and done_resp.code != 250
+        return error_result(local_path, "FTP upload incomplete: " + done_resp.message, sent)
+    end
+
+    return ok_result(local_path, sent, file_bytes)
+end

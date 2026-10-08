@@ -1,0 +1,442 @@
+## Checksum & Data Integrity Verification
+##
+## Part of the Alya Language package ecosystem (https://github.com/alya-lang).
+## High-performance integrity verification supporting CRC-32, MD5, and SHA-256.
+
+import "../types.alya"
+
+# ───────────────────────────────────────────────────────────────
+# Hex Helpers
+# ───────────────────────────────────────────────────────────────
+
+function byte_to_hex_pair(b: int) -> string
+    let hex_chars = "0123456789abcdef"
+    let hi = bit_and(bit_shr(b, 4), 15)
+    let lo = bit_and(b, 15)
+    return char_at(hex_chars, hi) + char_at(hex_chars, lo)
+end
+
+function bytes_to_hex_str(bytes_arr: array) -> string
+    let res: string = ""
+    let i: int = 0
+    let blen: int = len(bytes_arr)
+    while i < blen
+        res += byte_to_hex_pair(bytes_arr[i])
+        i += 1
+    end
+    return res
+end
+
+# ───────────────────────────────────────────────────────────────
+# CRC-32 (IEEE 802.3 Polynomial 0xEDB88320)
+# ───────────────────────────────────────────────────────────────
+
+## Computes the CRC-32 checksum integer of a string.
+pub function crc32_string(data: string) -> int
+    let crc: int = 4294967295 # 0xFFFFFFFF
+    let i: int = 0
+    let dlen: int = len(data)
+    while i < dlen
+        let b: int = ord(char_at(data, i))
+        crc = bit_xor(crc, b)
+        let j: int = 0
+        while j < 8
+            let mask: int = bit_and(crc, 1)
+            crc = bit_shr(crc, 1)
+            if mask != 0
+                crc = bit_xor(crc, 3988292384) # 0xEDB88320
+            end
+            j += 1
+        end
+        i += 1
+    end
+    return bit_xor(crc, 4294967295)
+end
+
+## Computes the CRC-32 checksum of a string formatted as an 8-character hex string.
+pub function crc32_hex(data: string) -> string
+    let val: int = crc32_string(data)
+    let b0 = bit_and(bit_shr(val, 24), 255)
+    let b1 = bit_and(bit_shr(val, 16), 255)
+    let b2 = bit_and(bit_shr(val, 8), 255)
+    let b3 = bit_and(val, 255)
+    return byte_to_hex_pair(b0) + byte_to_hex_pair(b1) + byte_to_hex_pair(b2) + byte_to_hex_pair(b3)
+end
+
+## Computes the CRC-32 checksum of a file on disk.
+pub function crc32_file(path: string) -> string
+    if file_exists(path) == false
+        return ""
+    end
+    let content: string = read_file(path)
+    return crc32_hex(content)
+end
+
+# ───────────────────────────────────────────────────────────────
+# MD5 Hash Implementation (RFC 1321)
+# ───────────────────────────────────────────────────────────────
+
+function md5_ff(a: int, b: int, c: int, d: int, x: int, s: int, ac: int) -> int
+    let f = bit_or(bit_and(b, c), bit_and(bit_not(b), d))
+    let sum = bit_and(a + f + x + ac, 4294967295)
+    let rot = bit_or(bit_shl(sum, s), bit_shr(sum, 32 - s))
+    return bit_and(rot + b, 4294967295)
+end
+
+function md5_gg(a: int, b: int, c: int, d: int, x: int, s: int, ac: int) -> int
+    let f = bit_or(bit_and(b, d), bit_and(c, bit_not(d)))
+    let sum = bit_and(a + f + x + ac, 4294967295)
+    let rot = bit_or(bit_shl(sum, s), bit_shr(sum, 32 - s))
+    return bit_and(rot + b, 4294967295)
+end
+
+function md5_hh(a: int, b: int, c: int, d: int, x: int, s: int, ac: int) -> int
+    let f = bit_xor(bit_xor(b, c), d)
+    let sum = bit_and(a + f + x + ac, 4294967295)
+    let rot = bit_or(bit_shl(sum, s), bit_shr(sum, 32 - s))
+    return bit_and(rot + b, 4294967295)
+end
+
+function md5_ii(a: int, b: int, c: int, d: int, x: int, s: int, ac: int) -> int
+    let f = bit_xor(c, bit_or(b, bit_not(d)))
+    let sum = bit_and(a + f + x + ac, 4294967295)
+    let rot = bit_or(bit_shl(sum, s), bit_shr(sum, 32 - s))
+    return bit_and(rot + b, 4294967295)
+end
+
+## Computes the MD5 digest of a string formatted as a 32-character hex string.
+pub function md5_hex(data: string) -> string
+    let msg_len: int = len(data)
+    let total_bits: int = msg_len * 8
+
+    let bytes = []
+    let i: int = 0
+    while i < msg_len
+        bytes.push(ord(char_at(data, i)))
+        i += 1
+    end
+
+    bytes.push(128) # 0x80
+    while len(bytes) % 64 != 56
+        bytes.push(0)
+    end
+
+    # Append 64-bit length in little-endian order
+    bytes.push(bit_and(total_bits, 255))
+    bytes.push(bit_and(bit_shr(total_bits, 8), 255))
+    bytes.push(bit_and(bit_shr(total_bits, 16), 255))
+    bytes.push(bit_and(bit_shr(total_bits, 24), 255))
+    bytes.push(0)
+    bytes.push(0)
+    bytes.push(0)
+    bytes.push(0)
+
+    let a: int = 1732584193
+    let b: int = 4023233417
+    let c: int = 2562383102
+    let d: int = 271733878
+
+    let chunk_idx: int = 0
+    let total_bytes: int = len(bytes)
+    while chunk_idx < total_bytes
+        let x = []
+        let j: int = 0
+        while j < 16
+            let pos: int = chunk_idx + (j * 4)
+            let w0: int = bit_or(bytes[pos], bit_shl(bytes[pos + 1], 8))
+            let w1: int = bit_or(bit_shl(bytes[pos + 2], 16), bit_shl(bytes[pos + 3], 24))
+            let w: int = bit_or(w0, w1)
+            x.push(w)
+            j += 1
+        end
+
+        let aa = a
+        let bb = b
+        let cc = c
+        let dd = d
+
+        # Round 1
+        a = md5_ff(a, b, c, d, x[0], 7, 3614090360)
+        d = md5_ff(d, a, b, c, x[1], 12, 3905402710)
+        c = md5_ff(c, d, a, b, x[2], 17, 606105819)
+        b = md5_ff(b, c, d, a, x[3], 22, 3250441966)
+        a = md5_ff(a, b, c, d, x[4], 7, 4118548399)
+        d = md5_ff(d, a, b, c, x[5], 12, 1200080426)
+        c = md5_ff(c, d, a, b, x[6], 17, 2821735955)
+        b = md5_ff(b, c, d, a, x[7], 22, 4249261313)
+        a = md5_ff(a, b, c, d, x[8], 7, 1770035416)
+        d = md5_ff(d, a, b, c, x[9], 12, 2336552879)
+        c = md5_ff(c, d, a, b, x[10], 17, 4294925233)
+        b = md5_ff(b, c, d, a, x[11], 22, 2304563134)
+        a = md5_ff(a, b, c, d, x[12], 7, 1804603682)
+        d = md5_ff(d, a, b, c, x[13], 12, 4254626195)
+        c = md5_ff(c, d, a, b, x[14], 17, 2792965006)
+        b = md5_ff(b, c, d, a, x[15], 22, 1236535329)
+
+        # Round 2
+        a = md5_gg(a, b, c, d, x[1], 5, 4129170786)
+        d = md5_gg(d, a, b, c, x[6], 9, 3225465664)
+        c = md5_gg(c, d, a, b, x[11], 14, 643717713)
+        b = md5_gg(b, c, d, a, x[0], 20, 3921069994)
+        a = md5_gg(a, b, c, d, x[5], 5, 3593408605)
+        d = md5_gg(d, a, b, c, x[10], 9, 38016083)
+        c = md5_gg(c, d, a, b, x[15], 14, 3634488961)
+        b = md5_gg(b, c, d, a, x[4], 20, 3889429448)
+        a = md5_gg(a, b, c, d, x[9], 5, 568446438)
+        d = md5_gg(d, a, b, c, x[14], 9, 3275163606)
+        c = md5_gg(c, d, a, b, x[3], 14, 4107603335)
+        b = md5_gg(b, c, d, a, x[8], 20, 1163531501)
+        a = md5_gg(a, b, c, d, x[13], 5, 2850285829)
+        d = md5_gg(d, a, b, c, x[2], 9, 4243563512)
+        c = md5_gg(c, d, a, b, x[7], 14, 1735328473)
+        b = md5_gg(b, c, d, a, x[12], 20, 2368359562)
+
+        # Round 3
+        a = md5_hh(a, b, c, d, x[5], 4, 4294588738)
+        d = md5_hh(d, a, b, c, x[8], 11, 2272392833)
+        c = md5_hh(c, d, a, b, x[11], 16, 1839030562)
+        b = md5_hh(b, c, d, a, x[14], 23, 4259657740)
+        a = md5_hh(a, b, c, d, x[1], 4, 2763975236)
+        d = md5_hh(d, a, b, c, x[4], 11, 1272893353)
+        c = md5_hh(c, d, a, b, x[7], 16, 4139469664)
+        b = md5_hh(b, c, d, a, x[10], 23, 3200236656)
+        a = md5_hh(a, b, c, d, x[13], 4, 681279174)
+        d = md5_hh(d, a, b, c, x[0], 11, 3936430074)
+        c = md5_hh(c, d, a, b, x[3], 16, 3572445317)
+        b = md5_hh(b, c, d, a, x[6], 23, 76029189)
+        a = md5_hh(a, b, c, d, x[9], 4, 3654602809)
+        d = md5_hh(d, a, b, c, x[12], 11, 3873151461)
+        c = md5_hh(c, d, a, b, x[15], 16, 530742520)
+        b = md5_hh(b, c, d, a, x[2], 23, 3299628645)
+
+        # Round 4
+        a = md5_ii(a, b, c, d, x[0], 6, 4096336452)
+        d = md5_ii(d, a, b, c, x[7], 10, 1126891415)
+        c = md5_ii(c, d, a, b, x[14], 15, 2878612391)
+        b = md5_ii(b, c, d, a, x[5], 21, 4237533241)
+        a = md5_ii(a, b, c, d, x[12], 6, 1700485571)
+        d = md5_ii(d, a, b, c, x[3], 10, 2399980690)
+        c = md5_ii(c, d, a, b, x[10], 15, 4293915773)
+        b = md5_ii(b, c, d, a, x[1], 21, 2240044497)
+        a = md5_ii(a, b, c, d, x[8], 6, 1873313359)
+        d = md5_ii(d, a, b, c, x[15], 10, 4264355552)
+        c = md5_ii(c, d, a, b, x[6], 15, 2734768916)
+        b = md5_ii(b, c, d, a, x[13], 21, 1309151649)
+        a = md5_ii(a, b, c, d, x[4], 6, 4149444226)
+        d = md5_ii(d, a, b, c, x[11], 10, 3174756917)
+        c = md5_ii(c, d, a, b, x[2], 15, 718787259)
+        b = md5_ii(b, c, d, a, x[9], 21, 3951481745)
+
+        a = bit_and(a + aa, 4294967295)
+        b = bit_and(b + bb, 4294967295)
+        c = bit_and(c + cc, 4294967295)
+        d = bit_and(d + dd, 4294967295)
+
+        chunk_idx += 64
+    end
+
+    # Format words in little-endian byte order
+    let res = ""
+    let words = [a, b, c, d]
+    let wi = 0
+    while wi < 4
+        let w = words[wi]
+        res += byte_to_hex_pair(bit_and(w, 255))
+        res += byte_to_hex_pair(bit_and(bit_shr(w, 8), 255))
+        res += byte_to_hex_pair(bit_and(bit_shr(w, 16), 255))
+        res += byte_to_hex_pair(bit_and(bit_shr(w, 24), 255))
+        wi += 1
+    end
+    return res
+end
+
+## Computes the MD5 checksum of a file on disk.
+pub function md5_file(path: string) -> string
+    if file_exists(path) == false
+        return ""
+    end
+    let content: string = read_file(path)
+    return md5_hex(content)
+end
+
+# ───────────────────────────────────────────────────────────────
+# SHA-256 Hash Implementation (FIPS 180-4)
+# ───────────────────────────────────────────────────────────────
+
+function sha256_rotr(x: int, n: int) -> int
+    return bit_or(bit_shr(x, n), bit_shl(x, 32 - n))
+end
+
+function sha256_k() -> array
+    return [
+        1116352408, 1899447441, 3049323471, 3921009573, 961987163, 1508970993, 2453635748, 2870763221,
+        3624381080, 310598401, 607225278, 1426881987, 1925078388, 2162078206, 2614888103, 3248222580,
+        3835390401, 4022224774, 264347078, 604807628, 770255983, 1249150122, 1555081692, 1996064986,
+        2554220882, 2821834349, 2952996808, 3210313671, 3336571891, 3584528711, 113926993, 338241895,
+        666307205, 773529912, 1294757372, 1396182291, 1695183700, 1986661051, 2177026350, 2456956037,
+        2730485921, 2820302411, 3259730800, 3345764771, 3516065817, 3600352804, 4094571909, 275423344,
+        430227734, 506948616, 659060556, 883997877, 958139571, 1322822218, 1537002063, 1747873779,
+        1955562222, 2024104815, 2227730452, 2361852424, 2428436474, 2756734187, 3204031479, 3329325298
+    ]
+end
+
+## Computes the SHA-256 digest of a string formatted as a 64-character hex string.
+pub function sha256_hex(data: string) -> string
+    let msg_len: int = len(data)
+    let total_bits: int = msg_len * 8
+
+    let bytes = []
+    let i: int = 0
+    while i < msg_len
+        bytes.push(ord(char_at(data, i)))
+        i += 1
+    end
+
+    bytes.push(128) # 0x80
+    while len(bytes) % 64 != 56
+        bytes.push(0)
+    end
+
+    # Append 64-bit length in big-endian order
+    bytes.push(bit_and(bit_shr(total_bits, 56), 255))
+    bytes.push(bit_and(bit_shr(total_bits, 48), 255))
+    bytes.push(bit_and(bit_shr(total_bits, 40), 255))
+    bytes.push(bit_and(bit_shr(total_bits, 32), 255))
+    bytes.push(bit_and(bit_shr(total_bits, 24), 255))
+    bytes.push(bit_and(bit_shr(total_bits, 16), 255))
+    bytes.push(bit_and(bit_shr(total_bits, 8), 255))
+    bytes.push(bit_and(total_bits, 255))
+
+    let h0: int = 1779033703
+    let h1: int = 3144134277
+    let h2: int = 1013904242
+    let h3: int = 2773480762
+    let h4: int = 1359893119
+    let h5: int = 2600822924
+    let h6: int = 528734635
+    let h7: int = 1541459225
+
+    let k = sha256_k()
+    let chunk_idx: int = 0
+    let total_bytes: int = len(bytes)
+
+    while chunk_idx < total_bytes
+        let w = []
+        let j: int = 0
+        while j < 16
+            let pos: int = chunk_idx + (j * 4)
+            let word0: int = bit_or(bit_shl(bytes[pos], 24), bit_shl(bytes[pos + 1], 16))
+            let word1: int = bit_or(bit_shl(bytes[pos + 2], 8), bytes[pos + 3])
+            let word: int = bit_or(word0, word1)
+            w.push(word)
+            j += 1
+        end
+
+        while j < 64
+            let s0: int = bit_xor(bit_xor(sha256_rotr(w[j - 15], 7), sha256_rotr(w[j - 15], 18)), bit_shr(w[j - 15], 3))
+            let s1: int = bit_xor(bit_xor(sha256_rotr(w[j - 2], 17), sha256_rotr(w[j - 2], 19)), bit_shr(w[j - 2], 10))
+            let sum_w: int = bit_and(w[j - 16] + s0 + w[j - 7] + s1, 4294967295)
+            w.push(sum_w)
+            j += 1
+        end
+
+        let a = h0
+        let b = h1
+        let c = h2
+        let d = h3
+        let e = h4
+        let f = h5
+        let g = h6
+        let h = h7
+
+        let step: int = 0
+        while step < 64
+            let s1_val: int = bit_xor(bit_xor(sha256_rotr(e, 6), sha256_rotr(e, 11)), sha256_rotr(e, 25))
+            let ch_val: int = bit_xor(bit_and(e, f), bit_and(bit_not(e), g))
+            let temp1: int = bit_and(h + s1_val + ch_val + k[step] + w[step], 4294967295)
+            let s0_val: int = bit_xor(bit_xor(sha256_rotr(a, 2), sha256_rotr(a, 13)), sha256_rotr(a, 22))
+            let maj_val: int = bit_xor(bit_xor(bit_and(a, b), bit_and(a, c)), bit_and(b, c))
+            let temp2: int = bit_and(s0_val + maj_val, 4294967295)
+
+            h = g
+            g = f
+            f = e
+            e = bit_and(d + temp1, 4294967295)
+            d = c
+            c = b
+            b = a
+            a = bit_and(temp1 + temp2, 4294967295)
+
+            step += 1
+        end
+
+        h0 = bit_and(h0 + a, 4294967295)
+        h1 = bit_and(h1 + b, 4294967295)
+        h2 = bit_and(h2 + c, 4294967295)
+        h3 = bit_and(h3 + d, 4294967295)
+        h4 = bit_and(h4 + e, 4294967295)
+        h5 = bit_and(h5 + f, 4294967295)
+        h6 = bit_and(h6 + g, 4294967295)
+        h7 = bit_and(h7 + h, 4294967295)
+
+        chunk_idx += 64
+    end
+
+    let res: string = ""
+    let hash_words = [h0, h1, h2, h3, h4, h5, h6, h7]
+    let hi_idx: int = 0
+    while hi_idx < 8
+        let hw = hash_words[hi_idx]
+        res += byte_to_hex_pair(bit_and(bit_shr(hw, 24), 255))
+        res += byte_to_hex_pair(bit_and(bit_shr(hw, 16), 255))
+        res += byte_to_hex_pair(bit_and(bit_shr(hw, 8), 255))
+        res += byte_to_hex_pair(bit_and(hw, 255))
+        hi_idx += 1
+    end
+    return res
+end
+
+## Computes the SHA-256 checksum of a file on disk.
+pub function sha256_file(path: string) -> string
+    if file_exists(path) == false
+        return ""
+    end
+    let content: string = read_file(path)
+    return sha256_hex(content)
+end
+
+# ───────────────────────────────────────────────────────────────
+# Unified Checksum Verification
+# ───────────────────────────────────────────────────────────────
+
+## Computes the checksum of a file according to specified algorithm enum.
+pub function compute_file_checksum(path: string, algo: int) -> string
+    return when algo
+        is ChecksumAlgo.Sha256 => sha256_file(path)
+        is ChecksumAlgo.Md5    => md5_file(path)
+        is ChecksumAlgo.Crc32  => crc32_file(path)
+        else                   => ""
+    end
+end
+
+## Computes the checksum of a string according to specified algorithm enum.
+pub function compute_string_checksum(data: string, algo: int) -> string
+    return when algo
+        is ChecksumAlgo.Sha256 => sha256_hex(data)
+        is ChecksumAlgo.Md5    => md5_hex(data)
+        is ChecksumAlgo.Crc32  => crc32_hex(data)
+        else                   => ""
+    end
+end
+
+## Verifies whether the checksum of a file matches the expected hash string.
+pub function verify_file_checksum(path: string, expected: string, algo: int) -> int
+    if expected == "" or algo == ChecksumAlgo.None
+        return 1
+    end
+    let actual: string = compute_file_checksum(path, algo)
+    if lower(actual) == lower(expected)
+        return 1
+    end
+    return 0
+end

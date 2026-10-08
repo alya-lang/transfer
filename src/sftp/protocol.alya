@@ -1,0 +1,218 @@
+## SFTP Protocol Messages & Packet Encoders (v3)
+##
+## Part of the Alya Language package ecosystem (https://github.com/alya-lang).
+## Implements high-level message builders and parsers for SSH File Transfer Protocol (SFTP).
+
+import "../types.alya"
+import "./packet.alya"
+
+# ───────────────────────────────────────────────────────────────
+# SFTP Protocol Constants
+# ───────────────────────────────────────────────────────────────
+
+pub enum SftpType
+    Init = 1,
+    Version = 2,
+    Open = 3,
+    Close = 4,
+    Read = 5,
+    Write = 6,
+    Lstat = 7,
+    Fstat = 8,
+    Status = 10,
+    Handle = 11,
+    Data = 12,
+    Name = 104
+end
+
+pub enum SftpOpenFlags
+    Read = 1,
+    Write = 2,
+    Append = 4,
+    Create = 8,
+    Truncate = 16,
+    Exclusive = 32
+end
+
+# ───────────────────────────────────────────────────────────────
+# Packet Constructors
+# ───────────────────────────────────────────────────────────────
+
+## Encodes an `SSH_FXP_INIT` packet proposing protocol version (defaults to 3).
+pub function sftp_build_init(version: int = 3) -> SftpPacket
+    let ver_bytes = encode_u32_bytes(version)
+    let inner_len = 1 + 4
+    let len_prefix = encode_u32_bytes(inner_len)
+    let wire = [len_prefix[0], len_prefix[1], len_prefix[2], len_prefix[3], SftpType.Init, ver_bytes[0], ver_bytes[1], ver_bytes[2], ver_bytes[3]]
+
+    return SftpPacket {
+        packet_type: SftpType.Init,
+        request_id: 0,
+        payload: "",
+        payload_bytes: wire
+    }
+end
+
+## Encodes an `SSH_FXP_OPEN` packet to open or create a remote file.
+pub function sftp_build_open(request_id: int, filename: string, flags: int = SftpOpenFlags.Read) -> SftpPacket
+    let path_bytes = encode_sftp_string_bytes(filename)
+    let flag_bytes = encode_u32_bytes(flags)
+    let attr_flags = encode_u32_bytes(0) # ATTRS flag = 0 (empty attributes)
+
+    let payload = []
+    let i = 0
+    while i < len(path_bytes)
+        payload.push(path_bytes[i])
+        i += 1
+    end
+    i = 0
+    while i < 4
+        payload.push(flag_bytes[i])
+        i += 1
+    end
+    i = 0
+    while i < 4
+        payload.push(attr_flags[i])
+        i += 1
+    end
+
+    let wire = pack_sftp_wire_packet(SftpType.Open, request_id, payload)
+    return SftpPacket {
+        packet_type: SftpType.Open,
+        request_id: request_id,
+        payload: filename,
+        payload_bytes: wire
+    }
+end
+
+## Encodes an `SSH_FXP_READ` packet to read bytes at a given offset (resumable).
+pub function sftp_build_read(request_id: int, handle: string, offset: int, length: int) -> SftpPacket
+    let h_bytes = encode_sftp_string_bytes(handle)
+    let off_bytes = encode_u64_bytes(offset)
+    let len_bytes = encode_u32_bytes(length)
+
+    let payload = []
+    let i = 0
+    while i < len(h_bytes)
+        payload.push(h_bytes[i])
+        i += 1
+    end
+    i = 0
+    while i < 8
+        payload.push(off_bytes[i])
+        i += 1
+    end
+    i = 0
+    while i < 4
+        payload.push(len_bytes[i])
+        i += 1
+    end
+
+    let wire = pack_sftp_wire_packet(SftpType.Read, request_id, payload)
+    return SftpPacket {
+        packet_type: SftpType.Read,
+        request_id: request_id,
+        payload: handle,
+        payload_bytes: wire
+    }
+end
+
+## Encodes an `SSH_FXP_WRITE` packet to write bytes at a given offset (resumable).
+pub function sftp_build_write(request_id: int, handle: string, offset: int, data: string) -> SftpPacket
+    let h_bytes = encode_sftp_string_bytes(handle)
+    let off_bytes = encode_u64_bytes(offset)
+    let data_bytes = encode_sftp_string_bytes(data)
+
+    let payload = []
+    let i = 0
+    while i < len(h_bytes)
+        payload.push(h_bytes[i])
+        i += 1
+    end
+    i = 0
+    while i < 8
+        payload.push(off_bytes[i])
+        i += 1
+    end
+    i = 0
+    while i < len(data_bytes)
+        payload.push(data_bytes[i])
+        i += 1
+    end
+
+    let wire = pack_sftp_wire_packet(SftpType.Write, request_id, payload)
+    return SftpPacket {
+        packet_type: SftpType.Write,
+        request_id: request_id,
+        payload: data,
+        payload_bytes: wire
+    }
+end
+
+## Encodes an `SSH_FXP_CLOSE` packet to close an active remote file handle.
+pub function sftp_build_close(request_id: int, handle: string) -> SftpPacket
+    let h_bytes = encode_sftp_string_bytes(handle)
+    let wire = pack_sftp_wire_packet(SftpType.Close, request_id, h_bytes)
+    return SftpPacket {
+        packet_type: SftpType.Close,
+        request_id: request_id,
+        payload: handle,
+        payload_bytes: wire
+    }
+end
+
+# ───────────────────────────────────────────────────────────────
+# Packet Decoders
+# ───────────────────────────────────────────────────────────────
+
+## Parses a wire byte array into an `SftpPacket` struct.
+pub function sftp_parse_packet(bytes_arr: array) -> SftpPacket
+    if len(bytes_arr) < 9
+        return SftpPacket { packet_type: 0, request_id: 0, payload: "", payload_bytes: bytes_arr }
+    end
+
+    let ptype = bytes_arr[4]
+    let req_id = decode_u32_bytes(bytes_arr, 5)
+
+    return SftpPacket {
+        packet_type: ptype,
+        request_id: req_id,
+        payload: "",
+        payload_bytes: bytes_arr
+    }
+end
+
+## Extracts the file handle string from an `SSH_FXP_HANDLE` packet.
+pub function sftp_parse_handle(packet: SftpPacket) -> string
+    let bytes = packet.payload_bytes
+    if len(bytes) < 13
+        return ""
+    end
+    let decoded = decode_sftp_string_bytes(bytes, 9)
+    return decoded["value"]
+end
+
+## Extracts the status code and diagnostic text from an `SSH_FXP_STATUS` packet.
+pub function sftp_parse_status(packet: SftpPacket) -> map
+    let bytes = packet.payload_bytes
+    let res = { "code": -1, "message": "" }
+    if len(bytes) < 13
+        return res
+    end
+    res["code"] = decode_u32_bytes(bytes, 9)
+    if len(bytes) > 13
+        let decoded = decode_sftp_string_bytes(bytes, 13)
+        res["message"] = decoded["value"]
+    end
+    return res
+end
+
+## Extracts the data payload string from an `SSH_FXP_DATA` packet.
+pub function sftp_parse_data(packet: SftpPacket) -> string
+    let bytes = packet.payload_bytes
+    if len(bytes) < 13
+        return ""
+    end
+    let decoded = decode_sftp_string_bytes(bytes, 9)
+    return decoded["value"]
+end

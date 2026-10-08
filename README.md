@@ -11,15 +11,14 @@ Multi-protocol file transfer toolkit for Alya: HTTP range, resumable downloads a
 
 ## 🌟 Features
 
-- ⚡ **Lightweight & High Performance**: Minimal memory overhead, zero runtime bloat, and fast native execution
-- 🧩 **Modular Architecture**: Layered multi-module design featuring a clean public facade (`src/lib.alya`), rich data models (`src/types.alya`), and encapsulated core formatters (`src/core/formatter.alya`)
-- 🔒 **Public/Private Visibility (`pub`)**: Fine-grained export control with `pub` for public functions, structs, and enums, keeping internal helper functions private and encapsulated
-- 🎭 **Structural Duck Typing & Interfaces**: Dynamic interface dispatch (`Summarizable`, `Describable`) without brittle inheritance hierarchies
-- 📦 **Rich Domain Models & Enums**: Idiomatic `enum` types (`TransferStatus`, `TransferPriority`, `TransferStyle`) and typed data containers (`TransferConfig`, `TransferResult`, `TransferStats`)
-- 🎯 **Advanced Pattern Matching**: Clean branching with `when` expressions, range matching, and condition guards
-- 🛡️ **Defensive Result Pattern**: Structured error handling and outcome encapsulation with `ok_result` and `error_result`
-- 🧪 **Enterprise Test & Benchmark Suite**: 100% test coverage with standard assertions (`std/test`) and micro-benchmarking (`std/test` bench runner)
-- 🚩 **Feature-Gated API Slices**: Optional capability slices via `[features]` in `alya.toml` (`default = ["extras"]`) and `@cfg(feature = "extras")` gating with a `@cfg(not(feature = "extras"))` fallback stub (see `src/core/extras.alya`)
+- 🌐 **Multi-Protocol Support**: Seamless transfers across HTTP, HTTPS, pure RFC 959 FTP, and SFTP v3 binary wire framing
+- ⏯️ **Resumable Transfers**: Automatic `.transfer_meta` state tracking; resumes interrupted downloads and uploads via RFC 7233 HTTP range requests (`Range: bytes=start-end`) and FTP restart markers (`REST` / `APPE`)
+- ⚡ **Bandwidth Throttling**: Token-bucket rate limiter enforcing configurable transfer speeds (`rate_limit_bps`)
+- 🔒 **Integrity & Checksums**: Built-in CRC-32 (IEEE 802.3), MD5 (RFC 1321), and SHA-256 (FIPS 180-4) verification engines
+- 📊 **Real-Time Progress Metrics**: Granular speed (B/s, KB/s, MB/s), ETA calculation, and visual ASCII progress bar rendering
+- 🛠️ **Fluent Builder API**: Ergonomic `TransferBuilder` chaining timeouts, chunk sizes, custom HTTP headers, basic auth, and progress callbacks
+- 🧩 **Zero External C Dependencies**: 100% pure Alya implementation with zero native toolchain compilation requirements
+- 🚩 **Feature-Gated API Slices**: Optional capability slices via `[features]` in `alya.toml` (`default = ["extras"]`) and `@cfg(feature = "extras")` gating multipart chunk planners and banners
 
 ---
 
@@ -31,21 +30,35 @@ transfer/
 ├── .editorconfig           # Uniform formatting rules across IDEs and editors
 ├── .gitignore              # Ecosystem standard ignore filters
 ├── .vscode/                # VS Code workspace settings, DAP launch configurations & tasks
-├── alya.toml               # Package manifest with dependencies, [features] and optional [build]
-├── c/                      # (Optional) Native C sources for zero-dependency FFI packages
+├── alya.toml               # Package manifest with dependencies, [features] and metadata
 ├── src/
-│   ├── lib.alya            # Public API facade (pub exports, re-exports & pipeline runners)
-│   ├── types.alya          # Data models, pub enums, pub structs, and struct methods
-│   ├── ffi.alya            # (Optional) Native extern "C" declarations
-│   └── core/               # Subdirectory module hierarchy
-│       ├── formatter.alya  # Domain formatting routines, salutation builders & pattern matchers
-│       └── extras.alya     # Feature-gated (`extras`) optional API slice with `@cfg` gating
+│   ├── lib.alya            # Public API facade (download, upload, ftp_download, checksums)
+│   ├── types.alya          # Domain models, TransferConfig, TransferProgress, TransferResult, enums
+│   ├── builder.alya        # Fluent TransferBuilder pipeline
+│   ├── core/               # Low-level utility and algorithm hierarchy
+│   │   ├── str_util.alya   # Internal string index, slicing, and matching utilities
+│   │   ├── url.alya        # RFC 3986 URL parsing and query/auth extraction
+│   │   ├── checksum.alya   # CRC-32, MD5, and SHA-256 integrity verification
+│   │   ├── progress.alya   # Speed, ETA, byte size, and duration formatters
+│   │   ├── throttle.alya   # Token-bucket rate limiting delay computation
+│   │   ├── resume.alya     # .transfer_meta token lifecycle and verification
+│   │   ├── formatter.alya  # Visual ASCII progress bar and summary formatting
+│   │   └── extras.alya     # Feature-gated (`extras`) multipart planning and banners
+│   ├── http/               # HTTP protocol engine
+│   │   ├── range.alya      # RFC 7233 byte-range header formatting and parsing
+│   │   └── client.alya     # Resumable HTTP download and upload socket engines
+│   ├── ftp/                # FTP protocol engine
+│   │   ├── protocol.alya   # RFC 959 command framing and PASV coordinate parser
+│   │   └── client.alya     # Control connection, passive data transfer, REST/APPE resume
+│   └── sftp/               # SFTP wire protocol
+│       ├── packet.alya     # Big-endian uint32/uint64 binary framing and packing
+│       └── protocol.alya   # SFTP v3 packet encoders (INIT, OPEN, READ, WRITE, CLOSE)
 ├── examples/
 │   └── demo.alya           # Comprehensive runnable walkthrough of all package capabilities
 ├── tests/
-│   └── test_basic.alya     # Automated test suite with 100% feature coverage
+│   └── test_basic.alya     # Automated test suite covering all modules
 └── benches/
-    └── bench_basic.alya    # Micro-benchmarks measuring performance and throughput
+    └── bench_basic.alya    # Micro-benchmarks measuring URL, CRC32, range, progress throughput
 ```
 
 > [!NOTE]
@@ -74,21 +87,26 @@ alya install
 ## 🚀 Quick Start
 
 ```alya
-import "transfer" as pkg
+import "transfer" as transfer
 
 function main()
-    # 1. Basic facade call with default parameter
-    let greeting = pkg::hello()
-    say f"Greeting:  {greeting}"
+    # 1. Fluent download builder with progress and rate limiting
+    let res = transfer::download("https://example.com/archive.tar.gz", "archive.tar.gz")
+        .chunk_size(65536)
+        .rate_limit(1048576)
+        .resumable(1)
+        .on_progress(function(prog)
+            say f"\r{prog.render_bar(25)} {prog.speed_bps} B/s"
+        end)
+        .execute()
 
-    # 2. Struct configuration with priority, style, and methods
-    let cfg = pkg::new_config("Community", 5, pkg::TransferPriority.High, pkg::TransferStyle.Formal)
-    say f"Summary:   {cfg.summary()}"
-    say f"Formatted: {pkg::core_format_custom(cfg)}"
+    if res.is_ok() == 1
+        say f"\nDownload completed: {res.bytes_transferred} bytes"
+    end
 
-    # 3. Processing pipeline returning Result model
-    let res = pkg::process("Analytics", 3, pkg::TransferPriority.Critical)
-    say f"Outcome:   {res.message}"
+    # 2. Direct checksum verification
+    let hash = transfer::sha256("alya package ecosystem")
+    say f"SHA-256: {hash}"
 end
 
 main()
@@ -100,45 +118,34 @@ main()
 
 | Symbol | Visibility | Description |
 |---|---|---|
-| `hello(name = "World")` | `pub function` | Returns a formatted greeting string. Defaults to `"World"` if null or empty. |
-| `new_config(name, count, priority, style)` | `pub function` | Factory constructing a `TransferConfig` with sensible defaults. |
-| `make_config(name, count, priority, style, enabled, tags)` | `pub function` | Full constructor for `TransferConfig`. |
-| `process(label, count, priority)` | `pub function` | Runs processing pipeline, returning an `ok_result` `TransferResult`. |
-| `process_batch(labels)` | `pub function` | Formats an array of labels in batch, returning an array of strings. |
-| `ok_result(value, message)` | `pub function` | Constructs a successful `TransferResult` container (`status = 0`). |
-| `error_result(message, errors)` | `pub function` | Constructs a failed `TransferResult` container (`status = 1`). |
-| `make_stats(total, passed, failed, skipped)` | `pub function` | Constructs a `TransferStats` metrics record. |
-| `format_summary(cfg)` | `pub function` | Formats summary of a config instance (satisfies `Summarizable`). |
-| `format_description(cfg)` | `pub function` | Formats description of a config instance (satisfies `Describable`). |
-| `format_config(config)` | `pub function` | Multi-field formatter producing descriptive overview of a `TransferConfig`. |
-| `format_result(result)` | `pub function` | Formats a `TransferResult` into `[OK]` or `[ERROR]` status line. |
-| `format_stats(stats)` | `pub function` | Formats total checked items and success rate percentage. |
-| `clamp(n, min_val, max_val)` | `pub function` | Clamps an integer value to the closed range `[min_val, max_val]`. |
-| `pluralize(n, singular, plural)` | `pub function` | Pattern-matches count to return singular or plural noun form. |
-| `repeat_string(label, count)` | `pub function` | Repeats a string into an array of `count` items. |
-| `extra_greeting(name = "World")` | `pub function` (`extras` feature, default-on) | Enthusiastic greeting slice gated by `@cfg(feature = "extras")`; stub throws a descriptive error when the feature is off. |
-| `Summarizable` | `pub interface` | Structural contract requiring `summary(self) -> string`. |
-| `Describable` | `pub interface` | Structural contract requiring `describe(self) -> string` and `is_valid(self) -> int`. |
-| `TransferStatus` | `pub enum` | Lifecycle status codes (`Pending = 0`, `Active = 1`, `Archived = 2`, `Error = 3`). |
-| `TransferPriority` | `pub enum` | Priority tiers (`Low = 0`, `Normal = 1`, `High = 2`, `Critical = 3`). |
-| `TransferStyle` | `pub enum` | Presentation styles (`Standard = 0`, `Formal = 1`, `Casual = 2`). |
-| `TransferConfig` | `pub struct` | Primary configuration model (`name`, `count`, `priority`, `style`, `enabled`, `tags`). |
-| `TransferConfig.summary()` | `pub method` | Single-line formatted summary (satisfies `Summarizable`). |
-| `TransferConfig.describe()` | `pub method` | Detailed multi-field description (satisfies `Describable`). |
-| `TransferConfig.is_valid()` | `pub method` | Validation guard returning 1 if valid, 0 otherwise. |
-| `TransferConfig.is_enabled()` | `pub method` | Returns 1 if active, 0 if disabled. |
-| `TransferConfig.with_name(new_name)` | `pub method` | Immutable copy with updated name. |
-| `TransferConfig.with_priority(new_prio)` | `pub method` | Immutable copy with updated priority tier. |
-| `TransferResult` | `pub struct` | Operation outcome model (`value`, `status`, `message`, `errors`). |
-| `TransferResult.is_ok()` | `pub method` | Returns 1 if successful (`status == 0`), 0 otherwise. |
-| `TransferResult.is_error()` | `pub method` | Returns 1 if error (`status != 0`), 0 otherwise. |
-| `TransferResult.unwrap_or(fallback)` | `pub method` | Returns message on success, or fallback on error. |
-| `TransferStats` | `pub struct` | Run statistics model (`total`, `passed`, `failed`, `skipped`). |
-| `TransferStats.total_checked()` | `pub method` | Sum of passed and failed items count. |
-| `TransferStats.success_rate()` | `pub method` | Computed percentage string (e.g. `"95%"`). |
+| `download(url, dest_path)` | `pub function` | Initiates a fluent `TransferBuilder` targeting a destination file path. |
+| `upload(url, src_path)` | `pub function` | Initiates a fluent `TransferBuilder` sourcing data from a local file path. |
+| `download_file(url, dest_path, config, on_progress)` | `pub function` | Direct download executor returning a `TransferResult`. |
+| `upload_file(url, src_path, config, on_progress)` | `pub function` | Direct upload executor returning a `TransferResult`. |
+| `ftp_download(host, port, user, pass, remote_path, local_path, resume, on_progress)` | `pub function` | RFC 959 FTP download with passive data mode and offset restart (`REST`). |
+| `ftp_upload(host, port, user, pass, local_path, remote_path, resume, on_progress)` | `pub function` | RFC 959 FTP upload with passive data mode and append mode (`APPE`). |
+| `new_config(timeout_ms, chunk_size, max_retries, rate_limit_bps, resumable)` | `pub function` | Factory constructing a `TransferConfig` with sensible defaults. |
+| `new_progress(bytes_transferred, total_bytes, speed_bps)` | `pub function` | Factory constructing a `TransferProgress` snapshot. |
+| `crc32(data)` | `pub function` | Computes the CRC-32 IEEE 802.3 checksum string of data. |
+| `md5(data)` | `pub function` | Computes the MD5 RFC 1321 hex digest of data. |
+| `sha256(data)` | `pub function` | Computes the SHA-256 FIPS 180-4 hex digest of data. |
+| `verify_checksum(path, expected, algo)` | `pub function` | Validates file integrity against expected hash value. |
+| `plan_multipart_chunks(total_bytes, chunk_count)` | `pub function` (`extras` feature) | Partitions byte ranges for parallel multi-part transfers. |
+| `format_transfer_banner(title)` | `pub function` (`extras` feature) | Renders formatted ASCII banner for CLI transfer tools. |
+| `TransferBuilder` | `pub struct` | Fluent builder with chained configuration setters and `execute()`. |
+| `TransferConfig` | `pub struct` | Configuration parameters (`timeout_ms`, `chunk_size`, `rate_limit_bps`, `resumable`, etc.). |
+| `TransferProgress` | `pub struct` | Real-time transfer metrics with `render_bar()`, `summary()`, and `is_complete()`. |
+| `TransferResult` | `pub struct` | Operation outcome with `is_ok()`, `is_error()`, and `summary()`. |
+| `ResumeMeta` | `pub struct` | Persistent resume metadata token (`.transfer_meta`) container. |
+| `FtpResponse` | `pub struct` | RFC 959 status reply container with `is_success()` and `is_error()`. |
+| `SftpPacket` | `pub struct` | Binary wire frame model for SFTP v3 packets. |
+| `TransferProtocol` | `pub enum` | Protocol discriminator (`Http = 0`, `Https = 1`, `Ftp = 2`, `Sftp = 3`, `File = 4`). |
+| `TransferMode` | `pub enum` | Direction mode (`Download = 0`, `Upload = 1`). |
+| `TransferStatus` | `pub enum` | Task lifecycle state (`Idle = 0`, `Running = 1`, `Paused = 2`, `Completed = 3`, `Failed = 4`, `Canceled = 5`). |
+| `ChecksumAlgo` | `pub enum` | Checksum algorithm selector (`None = 0`, `Sha256 = 1`, `Md5 = 2`, `Crc32 = 3`). |
 
 > [!TIP]
-> **Internal Helpers & Documentation:** Public symbols are documented with `##` Markdown docstrings, enabling automatic API documentation generation via `alya doc`. Private functions such as `build_salutation` and `build_priority_label` in `src/core/formatter.alya` are not annotated with `pub` and remain encapsulated within their respective modules.
+> **Internal Helpers & Documentation:** Public symbols are documented with `##` Markdown docstrings, enabling automatic API documentation generation via `alya doc`. Low-level protocol decoders and token-bucket computations in submodules are encapsulated.
 
 ---
 
@@ -211,6 +218,7 @@ Contributions are welcome! Please follow these steps:
 4. Verify tests and formatting before opening a PR:
    ```bash
    alya test
+   alya fmt . --check
    ```
 5. Commit your changes (`git commit -m "feat: add feature"`) and open a Pull Request
 

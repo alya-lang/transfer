@@ -1,0 +1,70 @@
+## Internal String Utilities
+##
+## Part of the Alya Language package ecosystem (https://github.com/alya-lang).
+## Self-contained, robust string searching, slicing, and splitting helpers.
+
+import "std/str"
+
+## Returns index of first match of `sub` in `s`, or -1 if not found.
+pub function find_index(s: string, sub: string) -> int
+    return index_of(s, sub)
+end
+
+## Returns index of last match of `sub` in `s`, or -1 if not found.
+pub function find_last_index(s: string, sub: string) -> int
+    return last_index_of(s, sub)
+end
+
+## Returns 1 if string starts with given prefix, 0 otherwise.
+pub function str_has_prefix(s: string, prefix: string) -> int
+    if starts_with(s, prefix) == true
+        return 1
+    end
+    return 0
+end
+
+## Returns 1 if string ends with given suffix, 0 otherwise.
+pub function str_has_suffix(s: string, suffix: string) -> int
+    if ends_with(s, suffix) == true
+        return 1
+    end
+    return 0
+end
+
+## Returns 1 if string contains given substring, 0 otherwise.
+pub function str_has_substr(s: string, sub: string) -> int
+    if contains_str(s, sub) == true
+        return 1
+    end
+    return 0
+end
+
+## Splits a string by a delimiter into an array of substrings.
+pub function split_str(s: string, delim: string) -> array
+    let res = []
+    let slen: int = len(s)
+    let dlen: int = len(delim)
+    if slen == 0
+        return res
+    end
+    if dlen == 0
+        res.push(s)
+        return res
+    end
+
+    let start: int = 0
+    let i: int = 0
+    while i <= slen - dlen
+        if substring(s, i, dlen) == delim
+            res.push(slice(s, start, i))
+            start = i + dlen
+            i = start
+        else
+            i += 1
+        end
+    end
+    if start <= slen
+        res.push(slice(s, start, slen))
+    end
+    return res
+end

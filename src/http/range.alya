@@ -1,0 +1,136 @@
+## HTTP Range Request & Header Processing
+##
+## Part of the Alya Language package ecosystem (https://github.com/alya-lang).
+## Builds and parses RFC 7233 byte-range request and response headers
+## (`Range`, `Content-Range`, `Accept-Ranges`, `If-Range`).
+
+import "../core/str_util.alya"
+
+## Formats an RFC 7233 Range header value.
+##
+## ### Parameters
+## - `start_byte`: Initial byte offset (0-indexed).
+## - `end_byte`: Ending byte offset (-1 for open-ended range `bytes=start-`).
+##
+## ### Returns
+## Formatted header value (e.g. `"bytes=1024-"` or `"bytes=0-4095"`).
+pub function build_range_header(start_byte: int, end_byte: int = -1) -> string
+    if end_byte < 0
+        return "bytes=" + str(start_byte) + "-"
+    end
+    return "bytes=" + str(start_byte) + "-" + str(end_byte)
+end
+
+## Parses a `Content-Range` header value into constituent bounds.
+##
+## Accepts format: `bytes <start>-<end>/<total>` or `bytes */<total>`.
+pub function parse_content_range(header_val: string) -> map
+    let res = {
+        "valid": 0,
+        "unit": "bytes",
+        "start": 0,
+        "end": 0,
+        "total": -1
+    }
+    if header_val is null or header_val == ""
+        return res
+    end
+
+    let val = trim(header_val)
+    let sp: int = find_index(val, " ")
+    if sp < 0
+        return res
+    end
+
+    let unit_str = slice(val, 0, sp)
+    let rest = trim(slice(val, sp + 1, len(val)))
+    res["unit"] = unit_str
+
+    let slash_idx: int = find_index(rest, "/")
+    if slash_idx < 0
+        return res
+    end
+
+    let range_part = slice(rest, 0, slash_idx)
+    let total_part = slice(rest, slash_idx + 1, len(rest))
+
+    if total_part != "*"
+        res["total"] = to_int(total_part)
+    end
+
+    if range_part != "*"
+        let dash_idx: int = find_index(range_part, "-")
+        if dash_idx >= 0
+            res["start"] = to_int(slice(range_part, 0, dash_idx))
+            res["end"] = to_int(slice(range_part, dash_idx + 1, len(range_part)))
+            res["valid"] = 1
+        end
+    else
+        res["valid"] = 1
+    end
+
+    return res
+end
+
+## Extracts the integer Content-Length from a headers map (case-insensitive).
+pub function parse_content_length(headers: map) -> int
+    if headers is null
+        return -1
+    end
+    let keys = headers.keys()
+    let i: int = 0
+    let count: int = len(keys)
+    while i < count
+        let k: string = keys[i]
+        if lower(k) == "content-length"
+            let val = headers[k]
+            return to_int(str(val))
+        end
+        i += 1
+    end
+    return -1
+end
+
+## Evaluates whether the server advertises support for range requests (`Accept-Ranges: bytes`).
+pub function is_range_supported(headers: map) -> bool
+    if headers is null
+        return false
+    end
+    let keys = headers.keys()
+    let i: int = 0
+    let count: int = len(keys)
+    while i < count
+        let k: string = keys[i]
+        if lower(k) == "accept-ranges"
+            let val: string = lower(str(headers[k]))
+            if str_has_substr(val, "bytes") == 1
+                return true
+            end
+        end
+        i += 1
+    end
+    return false
+end
+
+## Extracts an entity tag (ETag) from headers, stripped of surrounding quotes.
+pub function extract_etag(headers: map) -> string
+    if headers is null
+        return ""
+    end
+    let keys = headers.keys()
+    let i: int = 0
+    let count: int = len(keys)
+    while i < count
+        let k: string = keys[i]
+        if lower(k) == "etag"
+            let val: string = str(headers[k])
+            let trimmed = trim(val)
+            if str_has_prefix(trimmed, "\"") == 1 and str_has_suffix(trimmed, "\"") == 1 and len(trimmed) >= 2
+                return slice(trimmed, 1, len(trimmed) - 1)
+            end
+            return trimmed
+        end
+        i += 1
+    end
+    return ""
+end

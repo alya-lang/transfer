@@ -1,0 +1,81 @@
+## SFTP Binary Packet Framing & Byte Encoders
+##
+## Part of the Alya Language package ecosystem (https://github.com/alya-lang).
+## Implements big-endian binary packet serialization and deserialization
+## for the SSH File Transfer Protocol (SFTP v3).
+
+import "../types.alya"
+
+## Encodes a 32-bit integer as a 4-byte big-endian array.
+pub function encode_u32_bytes(val: int) -> array
+    let b0 = bit_and(bit_shr(val, 24), 255)
+    let b1 = bit_and(bit_shr(val, 16), 255)
+    let b2 = bit_and(bit_shr(val, 8), 255)
+    let b3 = bit_and(val, 255)
+    return [b0, b1, b2, b3]
+end
+
+## Decodes a 32-bit big-endian integer from a byte array at given offset.
+pub function decode_u32_bytes(bytes_arr: array, offset: int = 0) -> int
+    let b0 = bytes_arr[offset]
+    let b1 = bytes_arr[offset + 1]
+    let b2 = bytes_arr[offset + 2]
+    let b3 = bytes_arr[offset + 3]
+    return bit_or(bit_or(bit_shl(b0, 24), bit_shl(b1, 16)), bit_or(bit_shl(b2, 8), b3))
+end
+
+## Encodes a 64-bit integer as an 8-byte big-endian array.
+pub function encode_u64_bytes(val: int) -> array
+    let hi = bit_and(bit_shr(val, 32), 4294967295)
+    let lo = bit_and(val, 4294967295)
+    let b_hi = encode_u32_bytes(hi)
+    let b_lo = encode_u32_bytes(lo)
+    return [b_hi[0], b_hi[1], b_hi[2], b_hi[3], b_lo[0], b_lo[1], b_lo[2], b_lo[3]]
+end
+
+## Encodes a length-prefixed SFTP string into a byte array.
+pub function encode_sftp_string_bytes(str_val: string) -> array
+    let slen = len(str_val)
+    let len_bytes = encode_u32_bytes(slen)
+    let res = [len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]]
+    let i = 0
+    while i < slen
+        res.push(ord(char_at(str_val, i)))
+        i += 1
+    end
+    return res
+end
+
+## Decodes an SFTP length-prefixed string from a byte array starting at offset.
+##
+## Returns map with `value`: string, `next_offset`: int.
+pub function decode_sftp_string_bytes(bytes_arr: array, offset: int = 0) -> map
+    let slen = decode_u32_bytes(bytes_arr, offset)
+    let pos = offset + 4
+    let str_val = ""
+    let i = 0
+    while i < slen
+        str_val += chr(bytes_arr[pos + i])
+        i += 1
+    end
+    return {
+        "value": str_val,
+        "next_offset": pos + slen
+    }
+end
+
+## Packs type, request_id, and payload bytes into a complete wire SFTP packet.
+pub function pack_sftp_wire_packet(packet_type: int, request_id: int, payload_bytes: array) -> array
+    let inner_len: int = 1 + 4 + len(payload_bytes) # type (1) + id (4) + payload
+    let len_prefix = encode_u32_bytes(inner_len)
+    let id_bytes = encode_u32_bytes(request_id)
+
+    let wire = [len_prefix[0], len_prefix[1], len_prefix[2], len_prefix[3], packet_type, id_bytes[0], id_bytes[1], id_bytes[2], id_bytes[3]]
+    let i = 0
+    let plen = len(payload_bytes)
+    while i < plen
+        wire.push(payload_bytes[i])
+        i += 1
+    end
+    return wire
+end

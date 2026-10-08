@@ -1,0 +1,102 @@
+## Progress Tracking & Metric Calculation
+##
+## Part of the Alya Language package ecosystem (https://github.com/alya-lang).
+## Calculates throughput speed, ETA remaining time, formatted byte sizes,
+## and progress percentage for active data transfers.
+
+import "../types.alya"
+
+## Internal helper to format byte counts into human-readable units.
+pub function format_byte_size(bytes_count: int) -> string
+    if bytes_count < 0
+        return "0 B"
+    end
+    if bytes_count < 1024
+        return str(bytes_count) + " B"
+    end
+    if bytes_count < 1048576 # 1 MB
+        let kb = bytes_count / 1024
+        return str(kb) + " KB"
+    end
+    if bytes_count < 1073741824 # 1 GB
+        let mb = bytes_count / 1048576
+        return str(mb) + " MB"
+    end
+    let gb = bytes_count / 1073741824
+    return str(gb) + " GB"
+end
+
+## Internal helper to format seconds into HH:MM:SS or MM:SS strings.
+pub function format_duration(seconds: int) -> string
+    if seconds <= 0
+        return "00:00"
+    end
+    let hrs = seconds / 3600
+    let rem = seconds % 3600
+    let mins = rem / 60
+    let secs = rem % 60
+
+    let m_str = str(mins)
+    if mins < 10
+        m_str = "0" + m_str
+    end
+    let s_str = str(secs)
+    if secs < 10
+        s_str = "0" + s_str
+    end
+
+    if hrs > 0
+        let h_str = str(hrs)
+        if hrs < 10
+            h_str = "0" + h_str
+        end
+        return h_str + ":" + m_str + ":" + s_str
+    end
+    return m_str + ":" + s_str
+end
+
+## State tracker struct for cumulative transfer metrics.
+pub struct ProgressTracker
+    total_bytes: int,
+    bytes_transferred: int,
+    start_time_ms: int,
+    last_update_ms: int,
+    last_bytes: int
+end
+
+## Creates a new `ProgressTracker` instance.
+pub function progress_tracker_new(total_bytes: int = -1, start_time_ms: int = 0) -> ProgressTracker
+    return ProgressTracker {
+        total_bytes: total_bytes,
+        bytes_transferred: 0,
+        start_time_ms: start_time_ms,
+        last_update_ms: start_time_ms,
+        last_bytes: 0
+    }
+end
+
+## Updates progress tracker and returns a new `TransferProgress` snapshot.
+pub function progress_update(tracker: ProgressTracker, current_bytes: int, current_time_ms: int) -> TransferProgress
+    tracker.bytes_transferred = current_bytes
+
+    let elapsed_ms: int = current_time_ms - tracker.start_time_ms
+    if elapsed_ms < 0
+        elapsed_ms = 0
+    end
+
+    let speed_bps: int = 0
+    if elapsed_ms > 0
+        speed_bps = (current_bytes * 1000) / elapsed_ms
+    end
+
+    let eta_seconds: int = 0
+    if tracker.total_bytes > current_bytes and speed_bps > 0
+        let remaining_bytes = tracker.total_bytes - current_bytes
+        eta_seconds = remaining_bytes / speed_bps
+    end
+
+    tracker.last_update_ms = current_time_ms
+    tracker.last_bytes = current_bytes
+
+    return make_progress(current_bytes, tracker.total_bytes, speed_bps, elapsed_ms, eta_seconds)
+end

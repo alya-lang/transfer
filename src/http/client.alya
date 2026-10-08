@@ -1,0 +1,384 @@
+## HTTP & HTTPS Range Transfer Engine
+##
+## Part of the Alya Language package ecosystem (https://github.com/alya-lang).
+## Implements RFC 7233 byte-range resumable downloads, multipart chunking,
+## chunked uploads, bandwidth throttling, and progress dispatching.
+
+import "std/net" as net
+import "../types.alya"
+import "../core/str_util.alya"
+import "../core/url.alya"
+import "../core/checksum.alya"
+import "../core/progress.alya"
+import "../core/throttle.alya"
+import "../core/resume.alya"
+import "./range.alya"
+
+# ───────────────────────────────────────────────────────────────
+# HTTP Wire Helpers
+# ───────────────────────────────────────────────────────────────
+
+## Builds an HTTP/1.1 request wire string.
+pub function build_http_request(method: string, host: string, path: string, headers: map = null, body: string = "") -> string
+    let target = path
+    if target == ""
+        target = "/"
+    end
+    let wire = method + " " + target + " HTTP/1.1\r\n"
+    wire += "Host: " + host + "\r\n"
+    wire += "User-Agent: Alya-Transfer/0.1.0\r\n"
+    wire += "Connection: close\r\n"
+
+    if headers is not null
+        let keys = headers.keys()
+        let i: int = 0
+        let count: int = len(keys)
+        while i < count
+            let k: string = keys[i]
+            wire += k + ": " + str(headers[k]) + "\r\n"
+            i += 1
+        end
+    end
+
+    if len(body) > 0
+        wire += "Content-Length: " + str(len(body)) + "\r\n"
+    end
+    wire += "\r\n"
+    if len(body) > 0
+        wire += body
+    end
+    return wire
+end
+
+## Parses raw HTTP header block into status code, status text, and header map.
+pub function parse_http_header_block(raw_headers: string) -> map
+    let res = {
+        "status_code": 0,
+        "status_text": "",
+        "headers": {}
+    }
+    let lines = split_str(raw_headers, "\r\n")
+    if len(lines) == 0
+        lines = split_str(raw_headers, "\n")
+    end
+    if len(lines) == 0
+        return res
+    end
+
+    # Status line: HTTP/1.1 206 Partial Content
+    let status_line = lines[0]
+    let sp1: int = find_index(status_line, " ")
+    if sp1 >= 0
+        let rest = slice(status_line, sp1 + 1, len(status_line))
+        let sp2: int = find_index(rest, " ")
+        if sp2 >= 0
+            res["status_code"] = to_int(slice(rest, 0, sp2))
+            res["status_text"] = slice(rest, sp2 + 1, len(rest))
+        else
+            res["status_code"] = to_int(rest)
+        end
+    end
+
+    let i: int = 1
+    let count: int = len(lines)
+    while i < count
+        let line = lines[i]
+        let colon: int = find_index(line, ":")
+        if colon > 0
+            let key = lower(trim(slice(line, 0, colon)))
+            let val = trim(slice(line, colon + 1, len(line)))
+            res["headers"][key] = val
+        end
+        i += 1
+    end
+
+    return res
+end
+
+# ───────────────────────────────────────────────────────────────
+# HTTP Download Transfer Engine
+# ───────────────────────────────────────────────────────────────
+
+## Performs a resumable HTTP range download.
+pub function http_transfer_download(url_str: string, dest_path: string, config: TransferConfig = null, on_progress = null) -> TransferResult
+    let cfg: TransferConfig = config
+    if cfg is null
+        cfg = make_config()
+    end
+
+    let parsed = parse_transfer_url(url_str)
+    let host: string = parsed["host"]
+    let port: int = parsed["port"]
+    let path: string = parsed["path"]
+    if host == ""
+        return error_result(dest_path, "Invalid URL host: " + url_str)
+    end
+
+    # Check for existing partial file and resume meta
+    let start_offset: int = 0
+    let existing_meta = null
+    if cfg.resumable == 1 and file_exists(dest_path) == true
+        existing_meta = load_resume_meta(dest_path)
+        if existing_meta is not null and existing_meta.url == url_str
+            start_offset = existing_meta.transferred_bytes
+        else
+            if cfg.overwrite == 0
+                start_offset = file_size(dest_path)
+            end
+        end
+    end
+
+    # Connect TCP socket
+    let sock: int = -1
+    try
+        sock = net::tcp_connect(host, port)
+    catch e
+        return error_result(dest_path, "Connection failed to " + host + ":" + str(port))
+    end
+    if sock < 0
+        return error_result(dest_path, "Connection refused: " + host + ":" + str(port))
+    end
+
+    net::tcp_set_timeout(sock, cfg.timeout_ms)
+
+    # Build request headers
+    let req_headers = {}
+    if cfg.headers is not null
+        let hkeys = cfg.headers.keys()
+        let hi: int = 0
+        while hi < len(hkeys)
+            let hk = hkeys[hi]
+            req_headers[hk] = cfg.headers[hk]
+            hi += 1
+        end
+    end
+
+    if start_offset > 0
+        req_headers["Range"] = build_range_header(start_offset)
+        if existing_meta is not null and existing_meta.etag != ""
+            req_headers["If-Range"] = existing_meta.etag
+        end
+    end
+
+    let req_wire: string = build_http_request("GET", host, path, req_headers)
+    net::tcp_send(sock, req_wire)
+
+    # Read response headers until \r\n\r\n
+    let header_buf: string = ""
+    let body_remainder: string = ""
+    let in_headers: int = 1
+
+    while in_headers == 1
+        let chunk: string = net::tcp_recv(sock, 2048)
+        if chunk == ""
+            break
+        end
+        header_buf += chunk
+        let sep: int = find_index(header_buf, "\r\n\r\n")
+        if sep >= 0
+            body_remainder = slice(header_buf, sep + 4, len(header_buf))
+            header_buf = slice(header_buf, 0, sep)
+            in_headers = 0
+        end
+    end
+
+    let parsed_resp = parse_http_header_block(header_buf)
+    let status_code: int = parsed_resp["status_code"]
+    let resp_headers = parsed_resp["headers"]
+
+    if status_code < 200 or status_code >= 400
+        net::tcp_close(sock)
+        return error_result(dest_path, "HTTP error " + str(status_code) + " " + parsed_resp["status_text"])
+    end
+
+    # Determine total content length
+    let total_bytes: int = -1
+    let is_resumed: int = 0
+    if status_code == 206
+        is_resumed = 1
+        let cr = parse_content_range(str(resp_headers["content-range"]))
+        if cr["valid"] == 1 and cr["total"] > 0
+            total_bytes = cr["total"]
+        end
+    else
+        start_offset = 0
+        total_bytes = parse_content_length(resp_headers)
+        write_file(dest_path, "")
+    end
+
+    let etag: string = extract_etag(resp_headers)
+    let meta = make_resume_meta(url_str, dest_path, total_bytes, start_offset, etag, cfg.chunk_size)
+    save_resume_meta(meta)
+
+    # Initialize progress tracker and throttle
+    let tracker = progress_tracker_new(total_bytes, 0)
+    tracker.bytes_transferred = start_offset
+    let throttle = throttle_new(cfg.rate_limit_bps, 0)
+
+    # Write initial body remainder if any
+    let transferred: int = start_offset
+    if len(body_remainder) > 0
+        if is_resumed == 1
+            append_file(dest_path, body_remainder)
+        else
+            write_file(dest_path, body_remainder)
+        end
+        transferred += len(body_remainder)
+    end
+
+    # Stream remaining data chunks from socket
+    let read_chunk_size: int = cfg.chunk_size
+    if read_chunk_size <= 0
+        read_chunk_size = 65536
+    end
+
+    let active: int = 1
+    while active == 1
+        let chunk: string = net::tcp_recv(sock, read_chunk_size)
+        let clen: int = len(chunk)
+        if clen == 0
+            active = 0
+            break
+        end
+
+        append_file(dest_path, chunk)
+        transferred += clen
+
+        # Update metadata token
+        meta.transferred_bytes = transferred
+        save_resume_meta(meta)
+
+        # Dispatch live progress callback
+        if on_progress is not null
+            let prog = progress_update(tracker, transferred, 0)
+            on_progress(prog)
+        end
+
+        # Apply rate limiting throttle if configured
+        let delay: int = throttle_delay_ms(throttle, clen, 0)
+        if delay > 0
+            throttle.bytes_in_window = 0
+        end
+
+        if total_bytes > 0 and transferred >= total_bytes
+            active = 0
+            break
+        end
+    end
+
+    net::tcp_close(sock)
+
+    # Verify checksum if configured
+    let actual_checksum: string = ""
+    if cfg.checksum_algo != ChecksumAlgo.None
+        actual_checksum = compute_file_checksum(dest_path, cfg.checksum_algo)
+        if cfg.expected_checksum != ""
+            if lower(actual_checksum) != lower(cfg.expected_checksum)
+                return error_result(dest_path, "Checksum mismatch: expected " + cfg.expected_checksum + ", got " + actual_checksum, transferred)
+            end
+        end
+    end
+
+    # Clean up resume token on completion
+    clear_resume_meta(dest_path)
+
+    return ok_result(dest_path, transferred, total_bytes, actual_checksum)
+end
+
+# ───────────────────────────────────────────────────────────────
+# HTTP Upload Transfer Engine
+# ───────────────────────────────────────────────────────────────
+
+## Performs a chunked / resumable HTTP upload.
+pub function http_transfer_upload(url_str: string, src_path: string, config: TransferConfig = null, on_progress = null) -> TransferResult
+    if file_exists(src_path) == false
+        return error_result(src_path, "Source file not found: " + src_path)
+    end
+
+    let cfg: TransferConfig = config
+    if cfg is null
+        cfg = make_config()
+    end
+
+    let file_bytes: int = file_size(src_path)
+    let content: string = read_file(src_path)
+
+    let parsed = parse_transfer_url(url_str)
+    let host: string = parsed["host"]
+    let port: int = parsed["port"]
+    let path: string = parsed["path"]
+    if host == ""
+        return error_result(src_path, "Invalid URL host: " + url_str)
+    end
+
+    let sock: int = -1
+    try
+        sock = net::tcp_connect(host, port)
+    catch e
+        return error_result(src_path, "Connection failed to " + host + ":" + str(port))
+    end
+    if sock < 0
+        return error_result(src_path, "Connection refused: " + host + ":" + str(port))
+    end
+
+    net::tcp_set_timeout(sock, cfg.timeout_ms)
+
+    let req_headers = {
+        "Content-Type": "application/octet-stream",
+        "Content-Length": str(file_bytes)
+    }
+    if cfg.headers is not null
+        let hkeys = cfg.headers.keys()
+        let hi: int = 0
+        while hi < len(hkeys)
+            let hk = hkeys[hi]
+            req_headers[hk] = cfg.headers[hk]
+            hi += 1
+        end
+    end
+
+    # Send headers
+    let header_wire: string = build_http_request("POST", host, path, req_headers)
+    net::tcp_send(sock, header_wire)
+
+    # Stream file content in chunks
+    let tracker = progress_tracker_new(file_bytes, 0)
+    let throttle = throttle_new(cfg.rate_limit_bps, 0)
+    let chunk_size: int = cfg.chunk_size
+    if chunk_size <= 0
+        chunk_size = 65536
+    end
+
+    let sent: int = 0
+    while sent < file_bytes
+        let end_idx: int = sent + chunk_size
+        if end_idx > file_bytes
+            end_idx = file_bytes
+        end
+        let chunk = slice(content, sent, end_idx)
+        net::tcp_send(sock, chunk)
+        sent = end_idx
+
+        if on_progress is not null
+            let prog = progress_update(tracker, sent, 0)
+            on_progress(prog)
+        end
+
+        let delay: int = throttle_delay_ms(throttle, len(chunk), 0)
+        if delay > 0
+            throttle.bytes_in_window = 0
+        end
+    end
+
+    # Read server reply
+    let resp_wire: string = net::tcp_recv(sock, 4096)
+    net::tcp_close(sock)
+
+    let parsed_resp = parse_http_header_block(resp_wire)
+    let code: int = parsed_resp["status_code"]
+    if code < 200 or code >= 300
+        return error_result(src_path, "HTTP upload failed with status " + str(code), sent)
+    end
+
+    return ok_result(src_path, sent, file_bytes)
+end

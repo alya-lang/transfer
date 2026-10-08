@@ -1,0 +1,76 @@
+## FTP Protocol & Response Parsing (RFC 959)
+##
+## Part of the Alya Language package ecosystem (https://github.com/alya-lang).
+## Implements RFC 959 File Transfer Protocol command framing, reply code
+## interpretation, and Passive Mode (PASV) coordinate decoding.
+
+import "../types.alya"
+import "../core/str_util.alya"
+
+## Parses an FTP response line into numeric code and text message.
+##
+## Handles standard 3-digit codes (e.g. "220 Service ready", "230 User logged in").
+pub function ftp_parse_response(line: string) -> FtpResponse
+    let trimmed = trim(line)
+    if len(trimmed) < 3
+        return FtpResponse { code: -1, message: trimmed }
+    end
+
+    let code_str = slice(trimmed, 0, 3)
+    let code: int = to_int(code_str)
+    let msg: string = ""
+    if len(trimmed) > 4
+        msg = trim(slice(trimmed, 4, len(trimmed)))
+    end
+
+    return FtpResponse { code: code, message: msg }
+end
+
+## Decodes an RFC 959 PASV response string into host IP and data port.
+##
+## Parses format: `227 Entering Passive Mode (h1,h2,h3,h4,p1,p2)`.
+##
+## ### Returns
+## Map containing `valid`: 1/0, `ip`: string, `port`: int.
+pub function ftp_parse_pasv(response_line: string) -> map
+    let res = {
+        "valid": 0,
+        "ip": "",
+        "port": 0
+    }
+
+    let p1_idx: int = find_index(response_line, "(")
+    let p2_idx: int = find_index(response_line, ")")
+    if p1_idx < 0 or p2_idx <= p1_idx
+        return res
+    end
+
+    let inside: string = slice(response_line, p1_idx + 1, p2_idx)
+    let parts = split_str(inside, ",")
+    if len(parts) != 6
+        return res
+    end
+
+    let h1: string = trim(parts[0])
+    let h2: string = trim(parts[1])
+    let h3: string = trim(parts[2])
+    let h4: string = trim(parts[3])
+    let port_hi: int = to_int(trim(parts[4]))
+    let port_lo: int = to_int(trim(parts[5]))
+
+    let ip: string = h1 + "." + h2 + "." + h3 + "." + h4
+    let port: int = (port_hi * 256) + port_lo
+
+    res["valid"] = 1
+    res["ip"] = ip
+    res["port"] = port
+    return res
+end
+
+## Formats an FTP command line with trailing CRLF terminator.
+pub function ftp_format_command(cmd: string, arg: string = "") -> string
+    if arg == ""
+        return cmd + "\r\n"
+    end
+    return cmd + " " + arg + "\r\n"
+end

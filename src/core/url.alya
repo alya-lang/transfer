@@ -1,0 +1,111 @@
+## URL Parsing and Normalization Helpers
+##
+## Part of the Alya Language package ecosystem (https://github.com/alya-lang).
+## Lightweight, self-contained URL parsing tailored for transfer protocols
+## (HTTP, HTTPS, FTP, SFTP, and FILE schemes).
+
+import "./str_util.alya"
+
+## Parses a URL string into structured components.
+##
+## ### Parameters
+## - `raw_url`: Raw URL string (e.g. "ftp://admin:secret@ftp.example.com:2121/files/data.bin").
+##
+## ### Returns
+## Map containing keys: `scheme`, `host`, `port`, `path`, `query`, `user`, `pass`.
+pub function parse_transfer_url(raw_url: string) -> map
+    let res = {
+        "scheme": "http",
+        "host": "",
+        "port": 80,
+        "path": "/",
+        "query": "",
+        "user": "",
+        "pass": ""
+    }
+    if raw_url is null or raw_url == ""
+        return res
+    end
+
+    let s: string = raw_url
+    let scheme_end: int = find_index(s, "://")
+    let rest: string = s
+    if scheme_end >= 0
+        let scheme_str = slice(s, 0, scheme_end)
+        res["scheme"] = lower(scheme_str)
+        rest = slice(s, scheme_end + 3, len(s))
+    end
+
+    # Default ports by scheme
+    let sch: string = res["scheme"]
+    when sch
+        is "https" => res["port"] = 443
+        is "ftp"   => res["port"] = 21
+        is "sftp"  => res["port"] = 22
+        is "file"  => res["port"] = 0
+        else       => res["port"] = 80
+    end
+
+    # Extract path and query
+    let path_start: int = find_index(rest, "/")
+    let host_part: string = rest
+    if path_start >= 0
+        host_part = slice(rest, 0, path_start)
+        let path_and_q: string = slice(rest, path_start, len(rest))
+        let q_idx: int = find_index(path_and_q, "?")
+        if q_idx >= 0
+            res["path"] = slice(path_and_q, 0, q_idx)
+            res["query"] = slice(path_and_q, q_idx + 1, len(path_and_q))
+        else
+            res["path"] = path_and_q
+        end
+    else
+        res["path"] = "/"
+    end
+
+    # Check for credentials user:pass@host
+    let at_idx: int = find_index(host_part, "@")
+    if at_idx >= 0
+        let creds: string = slice(host_part, 0, at_idx)
+        host_part = slice(host_part, at_idx + 1, len(host_part))
+        let colon_idx: int = find_index(creds, ":")
+        if colon_idx >= 0
+            res["user"] = slice(creds, 0, colon_idx)
+            res["pass"] = slice(creds, colon_idx + 1, len(creds))
+        else
+            res["user"] = creds
+        end
+    end
+
+    # Check for host:port
+    let port_idx: int = find_index(host_part, ":")
+    if port_idx >= 0
+        res["host"] = slice(host_part, 0, port_idx)
+        let port_str: string = slice(host_part, port_idx + 1, len(host_part))
+        let parsed_port = to_int(port_str)
+        if parsed_port > 0
+            res["port"] = parsed_port
+        end
+    else
+        res["host"] = host_part
+    end
+
+    return res
+end
+
+## Extracts the filename from a URL path or full path.
+pub function extract_url_filename(url_or_path: string) -> string
+    if url_or_path is null or url_or_path == ""
+        return "download.bin"
+    end
+    let parsed = parse_transfer_url(url_or_path)
+    let p: string = parsed["path"]
+    if p == "" or p == "/"
+        return "download.bin"
+    end
+    let last_slash: int = find_last_index(p, "/")
+    if last_slash >= 0 and last_slash < len(p) - 1
+        return slice(p, last_slash + 1, len(p))
+    end
+    return p
+end

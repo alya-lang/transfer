@@ -9,168 +9,281 @@ function main()
     let r = runner_new()
 
     # ═══════════════════════════════════════════════════════════
-    # 1. Facade Greeting & Sanitization
+    # 1. Protocol & Lifecycle Enumerations
     # ═══════════════════════════════════════════════════════════
-    let res = pkg::hello("Alya")
-    runner_assert_str_eq(r, res, "Hello, Alya!", "pkg::hello returns formatted greeting")
+    runner_assert_eq(r, pkg::TransferProtocol.Http, 0, "TransferProtocol.Http == 0")
+    runner_assert_eq(r, pkg::TransferProtocol.Https, 1, "TransferProtocol.Https == 1")
+    runner_assert_eq(r, pkg::TransferProtocol.Ftp, 2, "TransferProtocol.Ftp == 2")
+    runner_assert_eq(r, pkg::TransferProtocol.Sftp, 3, "TransferProtocol.Sftp == 3")
+    runner_assert_eq(r, pkg::TransferProtocol.File, 4, "TransferProtocol.File == 4")
 
-    let default_res = pkg::hello()
-    runner_assert_str_eq(r, default_res, "Hello, World!", "pkg::hello() defaults to World")
+    runner_assert_eq(r, pkg::TransferMode.Download, 0, "TransferMode.Download == 0")
+    runner_assert_eq(r, pkg::TransferMode.Upload, 1, "TransferMode.Upload == 1")
 
-    let null_res = pkg::hello(null)
-    runner_assert_str_eq(r, null_res, "Hello, World!", "pkg::hello(null) sanitizes null to World")
+    runner_assert_eq(r, pkg::TransferStatus.Idle, 0, "TransferStatus.Idle == 0")
+    runner_assert_eq(r, pkg::TransferStatus.Running, 1, "TransferStatus.Running == 1")
+    runner_assert_eq(r, pkg::TransferStatus.Paused, 2, "TransferStatus.Paused == 2")
+    runner_assert_eq(r, pkg::TransferStatus.Completed, 3, "TransferStatus.Completed == 3")
+    runner_assert_eq(r, pkg::TransferStatus.Failed, 4, "TransferStatus.Failed == 4")
+    runner_assert_eq(r, pkg::TransferStatus.Canceled, 5, "TransferStatus.Canceled == 5")
 
-    let empty_res = pkg::hello("")
-    runner_assert_str_eq(r, empty_res, "Hello, World!", "pkg::hello(\"\") sanitizes empty string to World")
-
-    # ═══════════════════════════════════════════════════════════
-    # 2. Enumeration Values
-    # ═══════════════════════════════════════════════════════════
-    runner_assert_eq(r, pkg::TransferStatus.Pending, 0, "TransferStatus.Pending == 0")
-    runner_assert_eq(r, pkg::TransferStatus.Active, 1, "TransferStatus.Active == 1")
-    runner_assert_eq(r, pkg::TransferStatus.Archived, 2, "TransferStatus.Archived == 2")
-    runner_assert_eq(r, pkg::TransferStatus.Error, 3, "TransferStatus.Error == 3")
-
-    runner_assert_eq(r, pkg::TransferPriority.Low, 0, "TransferPriority.Low == 0")
-    runner_assert_eq(r, pkg::TransferPriority.Normal, 1, "TransferPriority.Normal == 1")
-    runner_assert_eq(r, pkg::TransferPriority.High, 2, "TransferPriority.High == 2")
-    runner_assert_eq(r, pkg::TransferPriority.Critical, 3, "TransferPriority.Critical == 3")
-
-    runner_assert_eq(r, pkg::TransferStyle.Standard, 0, "TransferStyle.Standard == 0")
-    runner_assert_eq(r, pkg::TransferStyle.Formal, 1, "TransferStyle.Formal == 1")
-    runner_assert_eq(r, pkg::TransferStyle.Casual, 2, "TransferStyle.Casual == 2")
+    runner_assert_eq(r, pkg::ChecksumAlgo.None, 0, "ChecksumAlgo.None == 0")
+    runner_assert_eq(r, pkg::ChecksumAlgo.Sha256, 1, "ChecksumAlgo.Sha256 == 1")
+    runner_assert_eq(r, pkg::ChecksumAlgo.Md5, 2, "ChecksumAlgo.Md5 == 2")
+    runner_assert_eq(r, pkg::ChecksumAlgo.Crc32, 3, "ChecksumAlgo.Crc32 == 3")
 
     # ═══════════════════════════════════════════════════════════
-    # 3. Struct Models & Factory Constructors
+    # 2. Configuration & Model Construction
     # ═══════════════════════════════════════════════════════════
-    let cfg = pkg::new_config("Community", 5, pkg::TransferPriority.High, pkg::TransferStyle.Formal)
-    runner_assert_str_eq(r, cfg.name, "Community", "cfg.name is initialized correctly")
-    runner_assert_eq(r, cfg.count, 5, "cfg.count is initialized correctly")
-    runner_assert_eq(r, cfg.priority, 2, "cfg.priority is initialized to High (2)")
-    runner_assert_eq(r, cfg.style, 1, "cfg.style is initialized to Formal (1)")
-    runner_assert_eq(r, cfg.enabled, 1, "cfg.enabled defaults to 1")
+    let cfg = pkg::new_config(10000, 32768, 5, 1048576, 1)
+    runner_assert_eq(r, cfg.timeout_ms, 10000, "cfg.timeout_ms is 10000")
+    runner_assert_eq(r, cfg.chunk_size, 32768, "cfg.chunk_size is 32768")
+    runner_assert_eq(r, cfg.max_retries, 5, "cfg.max_retries is 5")
+    runner_assert_eq(r, cfg.rate_limit_bps, 1048576, "cfg.rate_limit_bps is 1 MB/s")
+    runner_assert_eq(r, cfg.resumable, 1, "cfg.resumable is 1")
+    runner_assert_eq(r, cfg.is_valid(), 1, "cfg.is_valid() returns 1")
 
-    let full_cfg = pkg::make_config("Full", 10, pkg::TransferPriority.Critical, pkg::TransferStyle.Casual, 0, ["tag1", "tag2"])
-    runner_assert_str_eq(r, full_cfg.name, "Full", "full_cfg.name is correct")
-    runner_assert_eq(r, full_cfg.count, 10, "full_cfg.count is correct")
-    runner_assert_eq(r, full_cfg.priority, 3, "full_cfg.priority is Critical (3)")
-    runner_assert_eq(r, full_cfg.enabled, 0, "full_cfg.enabled is 0")
-    runner_assert_eq(r, len(full_cfg.tags), 2, "full_cfg.tags has 2 elements")
+    cfg.set_header("Authorization", "Bearer token123")
+    runner_assert_str_eq(r, cfg.headers["Authorization"], "Bearer token123", "cfg.set_header works")
 
-    # ═══════════════════════════════════════════════════════════
-    # 4. Struct Methods & Immutability
-    # ═══════════════════════════════════════════════════════════
-    let summ = cfg.summary()
-    runner_assert_str_eq(r, summ, "Community (count: 5, active)", "cfg.summary() returns expected formatted summary")
+    cfg.set_auth("admin", "secret")
+    runner_assert_str_eq(r, cfg.auth_user, "admin", "cfg.auth_user is admin")
+    runner_assert_str_eq(r, cfg.auth_pass, "secret", "cfg.auth_pass is secret")
 
-    let desc = cfg.describe()
-    runner_assert_true(r, len(desc) > 0, "cfg.describe() returns non-empty description")
+    cfg.set_checksum(pkg::ChecksumAlgo.Sha256, "abcdef")
+    runner_assert_eq(r, cfg.checksum_algo, pkg::ChecksumAlgo.Sha256, "cfg.checksum_algo is set")
+    runner_assert_str_eq(r, cfg.expected_checksum, "abcdef", "cfg.expected_checksum is set")
 
-    runner_assert_eq(r, cfg.is_valid(), true, "cfg.is_valid() returns 1 for valid configuration")
-    runner_assert_eq(r, cfg.is_enabled(), 1, "cfg.is_enabled() returns 1")
-
-    let updated_name_cfg = cfg.with_name("Contributors")
-    runner_assert_str_eq(r, updated_name_cfg.name, "Contributors", "with_name updates name")
-    runner_assert_str_eq(r, cfg.name, "Community", "original cfg.name remains immutable")
-
-    let updated_prio_cfg = cfg.with_priority(pkg::TransferPriority.Critical)
-    runner_assert_eq(r, updated_prio_cfg.priority, 3, "with_priority updates priority")
-    runner_assert_eq(r, cfg.priority, 2, "original cfg.priority remains unchanged")
+    let cfg_summary = cfg.summary()
+    runner_assert_eq(r, len(cfg_summary) > 0, true, "cfg.summary() is non-empty")
 
     # ═══════════════════════════════════════════════════════════
-    # 5. Result Container & Methods
+    # 3. Progress Tracking & Metrics Calculation
     # ═══════════════════════════════════════════════════════════
-    let ok_res = pkg::ok_result(42, "Computed successfully")
-    runner_assert_eq(r, ok_res.is_ok(), true, "ok_res.is_ok() == 1")
-    runner_assert_eq(r, ok_res.is_error(), false, "ok_res.is_error() == 0")
-    runner_assert_str_eq(r, ok_res.unwrap_or("fallback"), "Computed successfully", "ok_res unwrap_or returns message")
+    let prog = pkg::new_progress(5242880, 10485760, 1048576)
+    runner_assert_eq(r, prog.bytes_transferred, 5242880, "prog.bytes_transferred is 5 MB")
+    runner_assert_eq(r, prog.total_bytes, 10485760, "prog.total_bytes is 10 MB")
+    runner_assert_eq(r, prog.percent, 50, "prog.percent is 50%")
+    runner_assert_eq(r, prog.is_complete(), 0, "prog.is_complete() is 0 at 50%")
 
-    let err_res = pkg::error_result("Failed operation", ["Invalid input", "Timeout"])
-    runner_assert_eq(r, err_res.is_ok(), false, "err_res.is_ok() == 0")
-    runner_assert_eq(r, err_res.is_error(), true, "err_res.is_error() == 1")
-    runner_assert_str_eq(r, err_res.unwrap_or("fallback"), "fallback", "err_res unwrap_or returns fallback")
-    runner_assert_eq(r, len(err_res.errors), 2, "err_res contains 2 error details")
+    let done_prog = pkg::make_progress(100, 100, 10, 10, 0)
+    runner_assert_eq(r, done_prog.is_complete(), 1, "done_prog.is_complete() is 1 at 100%")
 
-    # ═══════════════════════════════════════════════════════════
-    # 6. Statistics Container & Methods
-    # ═══════════════════════════════════════════════════════════
-    let stats = pkg::make_stats(20, 18, 2, 0)
-    runner_assert_eq(r, stats.total, 20, "stats.total == 20")
-    runner_assert_eq(r, stats.passed, 18, "stats.passed == 18")
-    runner_assert_eq(r, stats.failed, 2, "stats.failed == 2")
-    runner_assert_eq(r, stats.total_checked(), 20, "stats.total_checked() == 20")
-    runner_assert_str_eq(r, stats.success_rate(), "90%", "stats.success_rate() == 90%")
+    let bar = prog.render_bar(20)
+    runner_assert_eq(r, len(bar) > 0, true, "render_bar produces non-empty bar")
 
-    # ═══════════════════════════════════════════════════════════
-    # 7. Duck Typing Polymorphism (Interfaces)
-    # ═══════════════════════════════════════════════════════════
-    let is_summ = cfg is pkg::Summarizable
-    runner_assert_true(r, is_summ, "cfg satisfies Summarizable interface implicitly")
-    let iface_summ = pkg::format_summary(cfg)
-    runner_assert_str_eq(r, iface_summ, "Community (count: 5, active)", "format_summary dispatches via Summarizable")
+    runner_assert_str_eq(r, pkg::format_size(500), "500 B", "format_size B")
+    runner_assert_str_eq(r, pkg::format_size(2048), "2 KB", "format_size KB")
+    runner_assert_str_eq(r, pkg::format_size(5242880), "5 MB", "format_size MB")
+    runner_assert_str_eq(r, pkg::format_size(2147483648), "2 GB", "format_size GB")
 
-    let is_desc = cfg is pkg::Describable
-    runner_assert_true(r, is_desc, "cfg satisfies Describable interface implicitly")
-    let iface_desc = pkg::format_description(cfg)
-    runner_assert_true(r, len(iface_desc) > 0, "format_description dispatches via Describable")
+    runner_assert_str_eq(r, pkg::format_time(45), "00:45", "format_time seconds")
+    runner_assert_str_eq(r, pkg::format_time(125), "02:05", "format_time minutes")
+    runner_assert_str_eq(r, pkg::format_time(3665), "01:01:05", "format_time hours")
 
-    # Struct that does not implement Summarizable
-    let is_stats_summ = stats is pkg::Summarizable
-    runner_assert_false(r, is_stats_summ, "stats does not satisfy Summarizable interface")
+    let tracker = pkg::progress_tracker_new(1000, 0)
+    let p_snap = pkg::progress_update(tracker, 500, 1000)
+    runner_assert_eq(r, p_snap.percent, 50, "tracker computes 50% percent")
+    runner_assert_eq(r, p_snap.speed_bps, 500, "tracker computes speed 500 bps")
 
     # ═══════════════════════════════════════════════════════════
-    # 8. Workflow Processing & Batching
+    # 4. Bandwidth Throttling & Rate Limiting
     # ═══════════════════════════════════════════════════════════
-    let proc_res = pkg::process("Alice", 3, pkg::TransferPriority.High)
-    runner_assert_eq(r, proc_res.is_ok(), 1, "pkg::process returns successful result")
-    runner_assert_str_eq(r, proc_res.message, "OK", "pkg::process message is OK")
+    let throttle = pkg::throttle_new(1000, 0) # 1000 B/s cap
+    let d0 = pkg::throttle_delay_ms(throttle, 500, 100)
+    runner_assert_eq(r, d0, 0, "throttle within rate limit requires 0ms delay")
 
-    let batch_in = ["Alpha", "Beta", "Gamma"]
-    let batch_out = pkg::process_batch(batch_in)
-    runner_assert_eq(r, len(batch_out), 3, "process_batch returns 3 formatted records")
-
-    let null_batch = pkg::process_batch(null)
-    runner_assert_eq(r, len(null_batch), 0, "process_batch(null) returns empty array")
+    let d1 = pkg::throttle_delay_ms(throttle, 1000, 200) # 1500 total in 200ms
+    runner_assert_eq(r, d1 > 0, true, "throttle above limit calculates positive delay")
 
     # ═══════════════════════════════════════════════════════════
-    # 9. Control Flow & Pattern Matching Utilities
+    # 5. Resumable Metadata Management
     # ═══════════════════════════════════════════════════════════
-    runner_assert_eq(r, pkg::clamp(50, 0, 100), 50, "clamp within bounds")
-    runner_assert_eq(r, pkg::clamp(-10, 0, 100), 0, "clamp lower bound")
-    runner_assert_eq(r, pkg::clamp(150, 0, 100), 100, "clamp upper bound")
+    let test_file = "temp_test_transfer.bin"
+    write_file(test_file, "hello world partial content")
 
-    runner_assert_str_eq(r, pkg::pluralize(1, "record", "records"), "record", "pluralize 1 gives singular")
-    runner_assert_str_eq(r, pkg::pluralize(0, "record", "records"), "records", "pluralize 0 gives plural")
-    runner_assert_str_eq(r, pkg::pluralize(5, "record", "records"), "records", "pluralize 5 gives plural")
+    let meta = pkg::make_resume_meta("http://example.com/file.bin", test_file, 100, 27, "etag-xyz", 16384)
+    runner_assert_eq(r, meta.is_valid(), 1, "meta.is_valid() is 1")
 
-    let repeated = pkg::repeat_string("item", 3)
-    runner_assert_eq(r, len(repeated), 3, "repeat_string produces 3 elements")
-    runner_assert_str_eq(r, repeated[0], "item", "repeated element matches input")
+    let saved = pkg::save_resume_meta(meta)
+    runner_assert_eq(r, saved != 0, true, "save_resume_meta succeeds")
+
+    let loaded = pkg::load_resume_meta(test_file)
+    runner_assert_eq(r, loaded is not null, true, "load_resume_meta returns non-null")
+    runner_assert_str_eq(r, loaded.url, "http://example.com/file.bin", "loaded meta url matches")
+    runner_assert_eq(r, loaded.total_bytes, 100, "loaded meta total_bytes is 100")
+    runner_assert_eq(r, loaded.transferred_bytes, 27, "loaded meta transferred_bytes is 27")
+    runner_assert_str_eq(r, loaded.etag, "etag-xyz", "loaded meta etag matches")
+
+    let resumable_ok = pkg::can_resume(test_file, "http://example.com/file.bin", 100)
+    runner_assert_eq(r, resumable_ok, true, "can_resume returns true")
+
+    pkg::clear_resume_meta(test_file)
+    let after_clear = pkg::load_resume_meta(test_file)
+    runner_assert_eq(r, after_clear is null, true, "clear_resume_meta deletes token file")
+    remove_file(test_file)
 
     # ═══════════════════════════════════════════════════════════
-    # 10. Destructuring: Tuples & Maps
+    # 6. HTTP Range & Content-Range Headers
     # ═══════════════════════════════════════════════════════════
-    let (t_prefix, t_count) = ("Custom", 42)
-    runner_assert_str_eq(r, t_prefix, "Custom", "tuple destructuring binds string")
-    runner_assert_eq(r, t_count, 42, "tuple destructuring binds integer")
+    let r_open = pkg::build_range_header(1024)
+    runner_assert_str_eq(r, r_open, "bytes=1024-", "build_range_header open-ended")
 
-    let pkg_info = { "name": "transfer", "version": "0.1.0" }
-    let { name: info_name, version: info_ver } = pkg_info
-    runner_assert_str_eq(r, info_name, "transfer", "map destructuring extracts key name")
-    runner_assert_str_eq(r, info_ver, "0.1.0", "map destructuring extracts key version")
+    let r_closed = pkg::build_range_header(0, 4095)
+    runner_assert_str_eq(r, r_closed, "bytes=0-4095", "build_range_header closed bounds")
+
+    let cr_parsed = pkg::parse_content_range("bytes 500-999/5000")
+    runner_assert_eq(r, cr_parsed["valid"], 1, "parse_content_range valid == 1")
+    runner_assert_eq(r, cr_parsed["start"], 500, "parse_content_range start is 500")
+    runner_assert_eq(r, cr_parsed["end"], 999, "parse_content_range end is 999")
+    runner_assert_eq(r, cr_parsed["total"], 5000, "parse_content_range total is 5000")
+
+    let h_map = {
+        "Content-Length": "123456",
+        "Accept-Ranges": "bytes",
+        "ETag": "\"etag-123\""
+    }
+    runner_assert_eq(r, pkg::parse_content_length(h_map), 123456, "parse_content_length is 123456")
+    runner_assert_eq(r, pkg::is_range_supported(h_map), true, "is_range_supported is true")
+    runner_assert_str_eq(r, pkg::extract_etag(h_map), "etag-123", "extract_etag strips quotes")
+
+    let raw_h = "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-499/1000\r\nContent-Length: 500\r\n"
+    let parsed_h = pkg::parse_http_header_block(raw_h)
+    runner_assert_eq(r, parsed_h["status_code"], 206, "parse_http_header_block status is 206")
+    runner_assert_str_eq(r, parsed_h["headers"]["content-length"], "500", "header content-length is 500")
 
     # ═══════════════════════════════════════════════════════════
-    # 11. Feature-Gated API (`extras`, default-on)
+    # 7. URL Parsing & Normalization
     # ═══════════════════════════════════════════════════════════
-    @cfg(feature = "extras")
-    let extra_res = pkg::extra_greeting("Alya")
-    @cfg(feature = "extras")
-    runner_assert_str_eq(r, extra_res, "Howdy, Alya!", "pkg::extra_greeting returns extras greeting")
+    let u1 = pkg::parse_transfer_url("http://example.com:8080/path/file.zip?token=123")
+    runner_assert_str_eq(r, u1["scheme"], "http", "u1 scheme is http")
+    runner_assert_str_eq(r, u1["host"], "example.com", "u1 host is example.com")
+    runner_assert_eq(r, u1["port"], 8080, "u1 port is 8080")
+    runner_assert_str_eq(r, u1["path"], "/path/file.zip", "u1 path is /path/file.zip")
+    runner_assert_str_eq(r, u1["query"], "token=123", "u1 query is token=123")
+
+    let u_ftp = pkg::parse_transfer_url("ftp://user:pass@ftp.dlptest.com/archive.tar.gz")
+    runner_assert_str_eq(r, u_ftp["scheme"], "ftp", "u_ftp scheme is ftp")
+    runner_assert_eq(r, u_ftp["port"], 21, "u_ftp default port is 21")
+    runner_assert_str_eq(r, u_ftp["user"], "user", "u_ftp user is user")
+    runner_assert_str_eq(r, u_ftp["pass"], "pass", "u_ftp pass is pass")
+
+    let u_sftp = pkg::parse_transfer_url("sftp://storage.internal/data.bin")
+    runner_assert_str_eq(r, u_sftp["scheme"], "sftp", "u_sftp scheme is sftp")
+    runner_assert_eq(r, u_sftp["port"], 22, "u_sftp default port is 22")
+
+    runner_assert_str_eq(r, pkg::extract_url_filename("http://example.com/downloads/setup.exe"), "setup.exe", "extract_url_filename")
+
+    # ═══════════════════════════════════════════════════════════
+    # 8. Cryptographic & Data Integrity Checksums
+    # ═══════════════════════════════════════════════════════════
+    # CRC-32 golden vectors
+    runner_assert_str_eq(r, pkg::crc32(""), "00000000", "CRC-32 empty string")
+    runner_assert_str_eq(r, pkg::crc32("123456789"), "cbf43926", "CRC-32 standard 123456789")
+    runner_assert_str_eq(r, pkg::crc32("The quick brown fox jumps over the lazy dog"), "414fa337", "CRC-32 fox")
+
+    # MD5 golden vectors
+    runner_assert_str_eq(r, pkg::md5(""), "d41d8cd98f00b204e9800998ecf8427e", "MD5 empty string")
+    runner_assert_str_eq(r, pkg::md5("hello"), "5d41402abc4b2a76b9719d911017c592", "MD5 hello")
+
+    # SHA-256 golden vectors
+    runner_assert_str_eq(r, pkg::sha256(""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "SHA-256 empty string")
+    runner_assert_str_eq(r, pkg::sha256("hello"), "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824", "SHA-256 hello")
+
+    # File checksum verification
+    let sum_file = "temp_checksum_test.txt"
+    write_file(sum_file, "hello")
+    runner_assert_eq(r, pkg::verify_checksum(sum_file, "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824", pkg::ChecksumAlgo.Sha256), 1, "verify_checksum SHA-256 matches")
+    runner_assert_eq(r, pkg::verify_checksum(sum_file, "5d41402abc4b2a76b9719d911017c592", pkg::ChecksumAlgo.Md5), 1, "verify_checksum MD5 matches")
+    remove_file(sum_file)
+
+    # ═══════════════════════════════════════════════════════════
+    # 9. FTP Protocol & PASV Decoding
+    # ═══════════════════════════════════════════════════════════
+    let ftp_resp = pkg::ftp_parse_response("220 Welcome to FTP Server")
+    runner_assert_eq(r, ftp_resp.code, 220, "ftp_parse_response code is 220")
+    runner_assert_str_eq(r, ftp_resp.message, "Welcome to FTP Server", "ftp_parse_response message")
+    runner_assert_eq(r, ftp_resp.is_preliminary(), 0, "ftp_resp.is_preliminary() == 0")
+    runner_assert_eq(r, ftp_resp.is_success(), 1, "ftp_resp.is_success() == 1")
+
+    let pasv_line = "227 Entering Passive Mode (192,168,1,50,195,149)"
+    let pasv = pkg::ftp_parse_pasv(pasv_line)
+    runner_assert_eq(r, pasv["valid"], 1, "ftp_parse_pasv valid == 1")
+    runner_assert_str_eq(r, pasv["ip"], "192.168.1.50", "ftp_parse_pasv ip is 192.168.1.50")
+    runner_assert_eq(r, pasv["port"], 50069, "ftp_parse_pasv port is 50069 ((195*256)+149)")
+
+    runner_assert_str_eq(r, pkg::ftp_format_command("USER", "test"), "USER test\r\n", "ftp_format_command")
+
+    # ═══════════════════════════════════════════════════════════
+    # 10. SFTP Binary Packet Framing (v3)
+    # ═══════════════════════════════════════════════════════════
+    let u32_bytes = pkg::encode_u32_bytes(305419896) # 0x12345678
+    runner_assert_eq(r, pkg::decode_u32_bytes(u32_bytes), 305419896, "u32 big-endian encode/decode roundtrip")
+
+    let sftp_init = pkg::sftp_build_init(3)
+    runner_assert_eq(r, sftp_init.packet_type, pkg::SftpType.Init, "sftp_build_init packet_type is Init")
+    runner_assert_eq(r, len(sftp_init.payload_bytes), 9, "sftp_build_init wire length is 9 bytes")
+
+    let sftp_open = pkg::sftp_build_open(101, "/data/logs.txt", pkg::SftpOpenFlags.Read)
+    runner_assert_eq(r, sftp_open.packet_type, pkg::SftpType.Open, "sftp_build_open packet_type is Open")
+    runner_assert_eq(r, sftp_open.request_id, 101, "sftp_build_open request_id is 101")
+
+    let sftp_read = pkg::sftp_build_read(102, "handle-1", 1024, 4096)
+    runner_assert_eq(r, sftp_read.packet_type, pkg::SftpType.Read, "sftp_build_read packet_type is Read")
+
+    let sftp_write = pkg::sftp_build_write(103, "handle-1", 2048, "binary payload")
+    runner_assert_eq(r, sftp_write.packet_type, pkg::SftpType.Write, "sftp_build_write packet_type is Write")
+
+    let sftp_close = pkg::sftp_build_close(104, "handle-1")
+    runner_assert_eq(r, sftp_close.packet_type, pkg::SftpType.Close, "sftp_build_close packet_type is Close")
+
+    let parsed_packet = pkg::sftp_parse_packet(sftp_close.payload_bytes)
+    runner_assert_eq(r, parsed_packet.packet_type, pkg::SftpType.Close, "sftp_parse_packet parses type Close")
+    runner_assert_eq(r, parsed_packet.request_id, 104, "sftp_parse_packet parses request_id 104")
+
+    # ═══════════════════════════════════════════════════════════
+    # 11. Fluent TransferBuilder API
+    # ═══════════════════════════════════════════════════════════
+    let dl_builder = pkg::download("http://example.com/movie.mp4", "movie.mp4")
+    .timeout(20000)
+    .chunk_size(65536)
+    .rate_limit(5242880)
+    .resumable(1)
+    .overwrite(1)
+    .auth("user", "pass")
+    .header("X-Custom", "Val")
+    .verify_sha256("1234567890abcdef")
+
+    runner_assert_eq(r, dl_builder.mode, pkg::TransferMode.Download, "dl_builder mode is Download")
+    runner_assert_eq(r, dl_builder.config.timeout_ms, 20000, "dl_builder timeout is 20000")
+    runner_assert_eq(r, dl_builder.config.chunk_size, 65536, "dl_builder chunk_size is 65536")
+    runner_assert_eq(r, dl_builder.config.rate_limit_bps, 5242880, "dl_builder rate_limit is 5 MB/s")
+    runner_assert_str_eq(r, dl_builder.config.headers["X-Custom"], "Val", "dl_builder header is set")
+    runner_assert_str_eq(r, dl_builder.config.expected_checksum, "1234567890abcdef", "dl_builder expected checksum is set")
+
+    let up_builder = pkg::upload("http://example.com/api/upload", "report.pdf")
+    .timeout(30000)
+    .rate_limit(1048576)
+
+    runner_assert_eq(r, up_builder.mode, pkg::TransferMode.Upload, "up_builder mode is Upload")
+    runner_assert_eq(r, up_builder.config.timeout_ms, 30000, "up_builder timeout is 30000")
+
+    # ═══════════════════════════════════════════════════════════
+    # 12. Feature-Gated Extras (Multipart Chunk Planning)
+    # ═══════════════════════════════════════════════════════════
+    let chunks = pkg::plan_multipart_chunks(1000, 4)
+    runner_assert_eq(r, len(chunks), 4, "plan_multipart_chunks creates 4 slices")
+    runner_assert_eq(r, chunks[0]["start"], 0, "chunk 0 start is 0")
+    runner_assert_eq(r, chunks[0]["end"], 249, "chunk 0 end is 249")
+    runner_assert_eq(r, chunks[1]["start"], 250, "chunk 1 start is 250")
+    runner_assert_eq(r, chunks[3]["end"], 999, "chunk 3 end is 999")
+
+    let banner = pkg::format_transfer_banner("Download Task Started")
+    runner_assert_eq(r, len(banner) > 0, true, "format_transfer_banner is non-empty")
 
     let failed = runner_summary(r)
     if failed > 0
+        say "Some transfer tests failed."
         exit(1)
     end
 end
-
-main()

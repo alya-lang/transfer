@@ -1,25 +1,19 @@
-## transfer Types & Data Structures
+## Transfer Types & Data Models
 ##
 ## Part of the Alya Language package ecosystem (https://github.com/alya-lang).
-## Defines configuration models, enumerations, structural interfaces, and associated methods
-## showcasing the full range of modern Alya type system capabilities.
+## Defines transfer protocols, lifecycle states, configuration models, progress
+## tracking metrics, and structural interfaces for multi-protocol transfers.
 
 # ───────────────────────────────────────────────────────────────
 # Structural Interfaces (Duck Typing)
 # ───────────────────────────────────────────────────────────────
 
 ## Public interface for objects capable of producing a formatted string summary.
-##
-## Any struct implementing a `summary(self) -> string` method implicitly
-## satisfies this interface via Alya's structural duck-typing runtime.
 pub interface Summarizable
     function summary(self) -> string
 end
 
 ## Public interface for objects that provide detailed status descriptions and validation.
-##
-## Structs implementing `describe(self) -> string` and `is_valid(self) -> int`
-## satisfy this contract without explicit inheritance declarations.
 pub interface Describable
     function describe(self) -> string
     function is_valid(self) -> int
@@ -29,33 +23,37 @@ end
 # Enumerations
 # ───────────────────────────────────────────────────────────────
 
-## Public enumeration of entity lifecycle status states.
-##
-## Defines sequential status codes from pending to completed or error states.
+## Supported transfer protocols.
+pub enum TransferProtocol
+    Http = 0,
+    Https = 1,
+    Ftp = 2,
+    Sftp = 3,
+    File = 4
+end
+
+## Transfer direction mode (download vs upload).
+pub enum TransferMode
+    Download = 0,
+    Upload = 1
+end
+
+## Lifecycle execution state of a transfer task.
 pub enum TransferStatus
-    Pending = 0,
-    Active = 1,
-    Archived = 2,
-    Error = 3
+    Idle = 0,
+    Running = 1,
+    Paused = 2,
+    Completed = 3,
+    Failed = 4,
+    Canceled = 5
 end
 
-## Public enumeration of operational priority levels.
-##
-## Used to determine dispatch scheduling, queue ordering, and urgency tiers.
-pub enum TransferPriority
-    Low = 0,
-    Normal = 1,
-    High = 2,
-    Critical = 3
-end
-
-## Public enumeration of greeting and presentation styles.
-##
-## Governs formatting salutations, prefixes, and stylistic tone.
-pub enum TransferStyle
-    Standard = 0,
-    Formal = 1,
-    Casual = 2
+## Cryptographic and integrity checksum algorithms.
+pub enum ChecksumAlgo
+    None = 0,
+    Sha256 = 1,
+    Md5 = 2,
+    Crc32 = 3
 end
 
 # ───────────────────────────────────────────────────────────────
@@ -64,199 +62,162 @@ end
 
 ## Configuration data model holding execution parameters and metadata.
 ##
-## Encapsulates target identity, counter thresholds, priority tier, stylistic
-## mode, active status flag, and associated classification tags.
-##
-## ### Fields
-## - `name`: Validated entity identifier string.
-## - `count`: Repetition limit or processing counter.
-## - `priority`: Operational priority level (`TransferPriority` enum value).
-## - `style`: Presentation style variant (`TransferStyle` enum value).
-## - `enabled`: Activation flag (1 for active, 0 for inactive).
-## - `tags`: Categorical metadata tags array.
+## Encapsulates timeouts, chunk sizing, concurrency, bandwidth limits,
+## retry policy, resume flags, checksum verification, and credentials.
 pub struct TransferConfig
-    name: string,
-    count: int,
-    priority: int,
-    style: int,
-    enabled: int,
-    tags: array
+    timeout_ms: int,
+    chunk_size: int,
+    max_retries: int,
+    retry_delay_ms: int,
+    rate_limit_bps: int,
+    resumable: int,
+    overwrite: int,
+    checksum_algo: int,
+    expected_checksum: string,
+    auth_user: string,
+    auth_pass: string,
+    headers: map
 end
 
-## Container representing the outcome of an operation.
+## Live progress metric reported during an active transfer.
 ##
-## Holds an optional payload value, numeric status code, informational message,
-## and accumulated error diagnostic messages.
+## Tracks transferred bytes, total size, throughput speed, elapsed time,
+## estimated remaining time (ETA), and completion percentage.
+pub struct TransferProgress
+    bytes_transferred: int,
+    total_bytes: int,
+    speed_bps: int,
+    elapsed_ms: int,
+    eta_seconds: int,
+    percent: int
+end
+
+## Final outcome container representing the result of a transfer.
 ##
-## ### Fields
-## - `value`: Result payload (any type, or null on failure).
-## - `status`: Outcome code (0 for success, non-zero for errors).
-## - `message`: Human-readable summary or error explanation.
-## - `errors`: Diagnostic error messages array.
+## Encapsulates success flag, final status, transferred byte count,
+## destination file path, computed checksum, error diagnostics, and duration.
 pub struct TransferResult
-    value,
+    success: int,
     status: int,
-    message: string,
-    errors: array
+    bytes_transferred: int,
+    total_bytes: int,
+    file_path: string,
+    checksum: string,
+    error_message: string,
+    elapsed_ms: int
 end
 
-## Aggregated run statistics tracking test, processing, or batch metrics.
+## Resumable transfer state token saved to a `.transfer_meta` file.
 ##
-## Records total observed items, successes, failures, and skipped items.
-##
-## ### Fields
-## - `total`: Total processed items count.
-## - `passed`: Succeeded items count.
-## - `failed`: Failed items count.
-## - `skipped`: Skipped items count.
-pub struct TransferStats
-    total: int,
-    passed: int,
-    failed: int,
-    skipped: int
+## Allows interrupted transfers to resume from the exact byte offset
+## without re-downloading or re-uploading completed chunks.
+pub struct ResumeMeta
+    url: string,
+    dest_path: string,
+    total_bytes: int,
+    transferred_bytes: int,
+    etag: string,
+    chunk_size: int,
+    created_at: int
 end
 
-# ───────────────────────────────────────────────────────────────
-# Private Helper Functions
-# ───────────────────────────────────────────────────────────────
-
-# Internal sanitizer ensuring a non-empty, non-null string fallback.
-function sanitize_text_internal(text, fallback: string) -> string
-    return when
-        text is null => fallback
-        text == ""   => fallback
-        else         => text
-    end
+## FTP server response line containing reply code and status text.
+pub struct FtpResponse
+    code: int,
+    message: string
 end
 
-# Formats integer division as a percentage string, clamping denominator zero.
-function format_percent_internal(passed: int, total: int) -> string
-    if total <= 0
-        return "0%"
-    end
-    let pct = (passed * 100) / total
-    return "{pct}%"
+## SFTP binary packet container.
+pub struct SftpPacket
+    packet_type: int,
+    request_id: int,
+    payload: string,
+    payload_bytes: array
 end
 
 # ───────────────────────────────────────────────────────────────
-# Public Sanitization and Factory Constructors
+# Factory Constructors
 # ───────────────────────────────────────────────────────────────
 
-## Validates and sanitizes a candidate name string.
-##
-## Replaces null or empty strings with the default `"World"` fallback.
-##
-## ### Parameters
-## - `name`: The candidate name value to sanitize.
-##
-## ### Returns
-## The validated string value, or `"World"` if empty or null.
-##
-## ### Examples
-## ```alya
-## let clean = sanitize_name(null) # "World"
-## let user = sanitize_name("Alice") # "Alice"
-## ```
-pub function sanitize_name(name) -> string
-    return sanitize_text_internal(name, "World")
-end
-
-## Factory constructor creating a validated `TransferConfig` instance.
-##
-## Sanitizes the input name and sets sensible defaults for optional fields.
-##
-## ### Parameters
-## - `name`: Entity identifier name. Defaults to `"World"`.
-## - `count`: Counter or repetition limit. Defaults to `1`.
-## - `priority`: Priority tier. Defaults to `TransferPriority.Normal`.
-## - `style`: Presentation style variant. Defaults to `TransferStyle.Standard`.
-## - `enabled`: Active flag. Defaults to `1`.
-## - `tags`: Categorization tags array. Defaults to `[]`.
-##
-## ### Returns
-## A fully initialized `TransferConfig` instance.
-##
-## ### Examples
-## ```alya
-## let cfg = make_config("Alice", 3, TransferPriority.High)
-## ```
-pub function make_config(name = "World", count: int = 1, priority: int = TransferPriority.Normal, style: int = TransferStyle.Standard, enabled: int = 1, tags: array = []) -> TransferConfig
-    let valid_name = sanitize_name(name)
+## Creates a new default `TransferConfig` instance.
+pub function make_config(timeout_ms: int = 15000, chunk_size: int = 65536, max_retries: int = 3, retry_delay_ms: int = 1000, rate_limit_bps: int = 0, resumable: int = 1, overwrite: int = 0) -> TransferConfig
     return TransferConfig {
-        name: valid_name,
-        count: count,
-        priority: priority,
-        style: style,
-        enabled: enabled,
-        tags: tags
+        timeout_ms: timeout_ms,
+        chunk_size: chunk_size,
+        max_retries: max_retries,
+        retry_delay_ms: retry_delay_ms,
+        rate_limit_bps: rate_limit_bps,
+        resumable: resumable,
+        overwrite: overwrite,
+        checksum_algo: ChecksumAlgo.None,
+        expected_checksum: "",
+        auth_user: "",
+        auth_pass: "",
+        headers: {}
     }
 end
 
-## Factory constructor creating a successful `TransferResult`.
-##
-## ### Parameters
-## - `value`: The success payload to encapsulate.
-## - `message`: Descriptive success message string. Defaults to `"OK"`.
-##
-## ### Returns
-## A `TransferResult` with status `0` and empty errors array.
-##
-## ### Examples
-## ```alya
-## let res = ok_result("Processed data", "Success")
-## ```
-pub function ok_result(value, message: string = "OK") -> TransferResult
+## Creates a new `TransferProgress` snapshot.
+pub function make_progress(bytes_transferred: int = 0, total_bytes: int = -1, speed_bps: int = 0, elapsed_ms: int = 0, eta_seconds: int = 0) -> TransferProgress
+    let pct: int = 0
+    if total_bytes > 0
+        pct = (bytes_transferred * 100) / total_bytes
+        if pct > 100
+            pct = 100
+        end
+    end
+    return TransferProgress {
+        bytes_transferred: bytes_transferred,
+        total_bytes: total_bytes,
+        speed_bps: speed_bps,
+        elapsed_ms: elapsed_ms,
+        eta_seconds: eta_seconds,
+        percent: pct
+    }
+end
+
+## Creates a successful `TransferResult` instance.
+pub function ok_result(file_path: string, bytes_transferred: int, total_bytes: int = -1, checksum: string = "", elapsed_ms: int = 0) -> TransferResult
+    let tot: int = total_bytes
+    if tot < 0
+        tot = bytes_transferred
+    end
     return TransferResult {
-        value: value,
-        status: 0,
-        message: message,
-        errors: []
+        success: 1,
+        status: TransferStatus.Completed,
+        bytes_transferred: bytes_transferred,
+        total_bytes: tot,
+        file_path: file_path,
+        checksum: checksum,
+        error_message: "",
+        elapsed_ms: elapsed_ms
     }
 end
 
-## Factory constructor creating a failed `TransferResult`.
-##
-## ### Parameters
-## - `message`: Descriptive error message string.
-## - `errors`: Diagnostic error details array. Defaults to `[]`.
-##
-## ### Returns
-## A `TransferResult` with status `1` and null value payload.
-##
-## ### Examples
-## ```alya
-## let err = error_result("Validation failed", ["Name is missing"])
-## ```
-pub function error_result(message: string, errors: array = []) -> TransferResult
+## Creates an error `TransferResult` instance.
+pub function error_result(file_path: string, error_message: string, bytes_transferred: int = 0, elapsed_ms: int = 0) -> TransferResult
     return TransferResult {
-        value: null,
-        status: 1,
-        message: message,
-        errors: errors
+        success: 0,
+        status: TransferStatus.Failed,
+        bytes_transferred: bytes_transferred,
+        total_bytes: 0,
+        file_path: file_path,
+        checksum: "",
+        error_message: error_message,
+        elapsed_ms: elapsed_ms
     }
 end
 
-## Factory constructor creating a `TransferStats` metric record.
-##
-## ### Parameters
-## - `total`: Total observed items count.
-## - `passed`: Succeeded items count.
-## - `failed`: Failed items count.
-## - `skipped`: Skipped items count. Defaults to `0`.
-##
-## ### Returns
-## A populated `TransferStats` record.
-##
-## ### Examples
-## ```alya
-## let stats = make_stats(100, 95, 5, 0)
-## ```
-pub function make_stats(total: int, passed: int, failed: int, skipped: int = 0) -> TransferStats
-    return TransferStats {
-        total: total,
-        passed: passed,
-        failed: failed,
-        skipped: skipped
+## Creates a new `ResumeMeta` instance for tracking resume state.
+pub function make_resume_meta(url: string, dest_path: string, total_bytes: int, transferred_bytes: int, etag: string = "", chunk_size: int = 65536) -> ResumeMeta
+    return ResumeMeta {
+        url: url,
+        dest_path: dest_path,
+        total_bytes: total_bytes,
+        transferred_bytes: transferred_bytes,
+        etag: etag,
+        chunk_size: chunk_size,
+        created_at: 0
     }
 end
 
@@ -265,170 +226,172 @@ end
 # ───────────────────────────────────────────────────────────────
 
 ## Returns a formatted single-line string summary of this configuration.
-##
-## Implicitly satisfies the `Summarizable` interface.
-##
-## ### Parameters
-## - `self`: The target `TransferConfig` instance.
-##
-## ### Returns
-## Formatted summary string in the form `"{name} (count: {count}, enabled: {enabled})"`.
 pub function TransferConfig.summary(self: TransferConfig) -> string
-    let active_str = when self.enabled
-        is true => "active"
-        else => "disabled"
+    let res_str = when self.resumable
+        is 1 => "resumable"
+        else => "non-resumable"
     end
-    return "{self.name} (count: {self.count}, {active_str})"
+    return "TransferConfig(timeout={self.timeout_ms}ms, chunk={self.chunk_size}B, {res_str})"
 end
 
 ## Returns a detailed multi-attribute description of this configuration.
-##
-## Implicitly satisfies the `Describable` interface.
-##
-## ### Parameters
-## - `self`: The target `TransferConfig` instance.
-##
-## ### Returns
-## Detailed descriptive string including priority and style codes.
 pub function TransferConfig.describe(self: TransferConfig) -> string
-    return "[Config] name={self.name}, count={self.count}, priority={self.priority}, style={self.style}"
+    return "[TransferConfig] timeout={self.timeout_ms}ms, chunk_size={self.chunk_size}, retries={self.max_retries}, rate_limit={self.rate_limit_bps}bps"
 end
 
 ## Validates whether this configuration conforms to essential operational constraints.
-##
-## Implicitly satisfies the `Describable` interface.
-##
-## ### Parameters
-## - `self`: The target `TransferConfig` instance.
-##
-## ### Returns
-## `1` if valid (non-empty name and count >= 0), `0` otherwise.
 pub function TransferConfig.is_valid(self: TransferConfig) -> int
-    if self.name == "" or self.count < 0
-        return false
+    if self.timeout_ms <= 0 or self.chunk_size <= 0
+        return 0
     end
-    return true
+    return 1
 end
 
-## Returns 1 if this configuration is enabled, 0 otherwise.
-##
-## ### Parameters
-## - `self`: The target `TransferConfig` instance.
-##
-## ### Returns
-## `1` when enabled, `0` when disabled.
-pub function TransferConfig.is_enabled(self: TransferConfig) -> int
-    return self.enabled
+## Sets a custom HTTP request header on this configuration.
+pub function TransferConfig.set_header(self: TransferConfig, key: string, val: string) -> TransferConfig
+    self.headers[key] = val
+    return self
 end
 
-## Returns a new configuration copy with an updated name.
-##
-## ### Parameters
-## - `self`: The current `TransferConfig` instance.
-## - `new_name`: The replacement name string.
-##
-## ### Returns
-## A new `TransferConfig` instance with updated name.
-pub function TransferConfig.with_name(self: TransferConfig, new_name) -> TransferConfig
-    return TransferConfig {
-        name: sanitize_name(new_name),
-        count: self.count,
-        priority: self.priority,
-        style: self.style,
-        enabled: self.enabled,
-        tags: self.tags
-    }
+## Sets basic authentication credentials on this configuration.
+pub function TransferConfig.set_auth(self: TransferConfig, user: string, pass: string) -> TransferConfig
+    self.auth_user = user
+    self.auth_pass = pass
+    return self
 end
 
-## Returns a new configuration copy with an updated priority level.
-##
-## ### Parameters
-## - `self`: The current `TransferConfig` instance.
-## - `new_priority`: New priority level from `TransferPriority`.
-##
-## ### Returns
-## A new `TransferConfig` instance with updated priority.
-pub function TransferConfig.with_priority(self: TransferConfig, new_priority: int) -> TransferConfig
-    return TransferConfig {
-        name: self.name,
-        count: self.count,
-        priority: new_priority,
-        style: self.style,
-        enabled: self.enabled,
-        tags: self.tags
-    }
+## Sets expected checksum verification on this configuration.
+pub function TransferConfig.set_checksum(self: TransferConfig, algo: int, expected: string) -> TransferConfig
+    self.checksum_algo = algo
+    self.expected_checksum = expected
+    return self
+end
+
+# ───────────────────────────────────────────────────────────────
+# Struct Methods: TransferProgress
+# ───────────────────────────────────────────────────────────────
+
+## Formats the live progress into a human-readable summary.
+pub function TransferProgress.summary(self: TransferProgress) -> string
+    return "{self.percent}% ({self.bytes_transferred}/{self.total_bytes} bytes)"
+end
+
+## Returns 1 if the progress indicates full completion.
+pub function TransferProgress.is_complete(self: TransferProgress) -> int
+    if self.total_bytes > 0 and self.bytes_transferred >= self.total_bytes
+        return 1
+    end
+    if self.percent >= 100
+        return 1
+    end
+    return 0
+end
+
+## Renders a textual progress bar for terminal display.
+pub function TransferProgress.render_bar(self: TransferProgress, width: int = 30) -> string
+    if width <= 0
+        width = 20
+    end
+    let filled: int = (self.percent * width) / 100
+    if filled > width
+        filled = width
+    end
+    let bar: string = "["
+    let i: int = 0
+    while i < filled
+        bar += "="
+        i += 1
+    end
+    if filled < width
+        bar += ">"
+        let j: int = filled + 1
+        while j < width
+            bar += " "
+            j += 1
+        end
+    end
+    bar += "] " + str(self.percent) + "%"
+    return bar
 end
 
 # ───────────────────────────────────────────────────────────────
 # Struct Methods: TransferResult
 # ───────────────────────────────────────────────────────────────
 
-## Returns 1 if this result represents a successful operation.
-##
-## ### Parameters
-## - `self`: The target `TransferResult` instance.
-##
-## ### Returns
-## `1` when status is `0`, `0` otherwise.
+## Returns 1 if this result represents a successful transfer.
 pub function TransferResult.is_ok(self: TransferResult) -> int
-    if self.status == 0
-        return true
+    if self.success == 1 and self.status == TransferStatus.Completed
+        return 1
     end
-    return false
+    return 0
 end
 
-## Returns 1 if this result represents an error condition.
-##
-## ### Parameters
-## - `self`: The target `TransferResult` instance.
-##
-## ### Returns
-## `1` when status is non-zero, `0` when status is `0`.
+## Returns 1 if this result represents a failed transfer.
 pub function TransferResult.is_error(self: TransferResult) -> int
-    if self.status != 0
-        return true
+    if self.success == 0 or self.status == TransferStatus.Failed
+        return 1
     end
-    return false
+    return 0
 end
 
-## Unwraps the result's message string, or returns a fallback string on error.
-##
-## ### Parameters
-## - `self`: The target `TransferResult` instance.
-## - `fallback`: Alternative string returned if this result represents an error.
-##
-## ### Returns
-## `message` on success, or `fallback` on error.
-pub function TransferResult.unwrap_or(self: TransferResult, fallback: string) -> string
-    if self.status == 0
-        return self.message
+## Returns a formatted single-line string summary of this result.
+pub function TransferResult.summary(self: TransferResult) -> string
+    if self.success == 1
+        return "TransferResult(OK, path='{self.file_path}', bytes={self.bytes_transferred}, elapsed={self.elapsed_ms}ms)"
     end
-    return fallback
+    return "TransferResult(FAILED, path='{self.file_path}', error='{self.error_message}')"
 end
 
 # ───────────────────────────────────────────────────────────────
-# Struct Methods: TransferStats
+# Struct Methods: ResumeMeta
 # ───────────────────────────────────────────────────────────────
 
-## Returns the total number of checked items (passed + failed).
-##
-## ### Parameters
-## - `self`: The target `TransferStats` instance.
-##
-## ### Returns
-## Integer sum of passed and failed items.
-pub function TransferStats.total_checked(self: TransferStats) -> int
-    return self.passed + self.failed
+## Validates whether this resume meta contains coherent non-empty parameters.
+pub function ResumeMeta.is_valid(self: ResumeMeta) -> int
+    if self.url == "" or self.dest_path == "" or self.transferred_bytes < 0
+        return 0
+    end
+    return 1
 end
 
-## Computes and returns the success rate percentage as a formatted string.
-##
-## ### Parameters
-## - `self`: The target `TransferStats` instance.
-##
-## ### Returns
-## Formatted percentage string (e.g. `"90%"`).
-pub function TransferStats.success_rate(self: TransferStats) -> string
-    let checked = self.passed + self.failed
-    return format_percent_internal(self.passed, checked)
+# ───────────────────────────────────────────────────────────────
+# Struct Methods: FtpResponse
+# ───────────────────────────────────────────────────────────────
+
+## Returns 1 if the FTP response represents a successful completion (2xx).
+pub function FtpResponse.is_success(self: FtpResponse) -> int
+    if self.code >= 200 and self.code < 300
+        return 1
+    end
+    return 0
+end
+
+## Returns 1 if the FTP response represents preliminary positive status (1xx).
+pub function FtpResponse.is_preliminary(self: FtpResponse) -> int
+    if self.code >= 100 and self.code < 200
+        return 1
+    end
+    return 0
+end
+
+## Returns 1 if the FTP response represents an error code (4xx or 5xx).
+pub function FtpResponse.is_error(self: FtpResponse) -> int
+    if self.code >= 400
+        return 1
+    end
+    return 0
+end
+
+# ───────────────────────────────────────────────────────────────
+# Struct Methods: SftpPacket
+# ───────────────────────────────────────────────────────────────
+
+## Returns the byte length of the payload in this SFTP packet.
+pub function SftpPacket.length(self: SftpPacket) -> int
+    return len(self.payload)
+end
+
+## Returns a formatted summary of this SFTP packet.
+pub function SftpPacket.summary(self: SftpPacket) -> string
+    return "SftpPacket(type={self.packet_type}, id={self.request_id}, len={len(self.payload)})"
 end

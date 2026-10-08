@@ -1,0 +1,117 @@
+## Resumable Transfer State Management
+##
+## Part of the Alya Language package ecosystem (https://github.com/alya-lang).
+## Manages `.transfer_meta` token files to support reliable pause/resume
+## of partially completed downloads and uploads.
+
+import "./str_util.alya"
+import "../types.alya"
+
+## Computes the metadata state filepath for a given target file.
+pub function meta_path_for(file_path: string) -> string
+    return file_path + ".transfer_meta"
+end
+
+## Saves resume metadata state to disk.
+pub function save_resume_meta(meta: ResumeMeta) -> int
+    if meta is null or meta.dest_path == ""
+        return 0
+    end
+    let mp: string = meta_path_for(meta.dest_path)
+    let content: string = "url=" + meta.url + "\n"
+    content += "dest_path=" + meta.dest_path + "\n"
+    content += "total_bytes=" + str(meta.total_bytes) + "\n"
+    content += "transferred_bytes=" + str(meta.transferred_bytes) + "\n"
+    content += "etag=" + meta.etag + "\n"
+    content += "chunk_size=" + str(meta.chunk_size) + "\n"
+    content += "created_at=" + str(meta.created_at) + "\n"
+
+    return write_file(mp, content)
+end
+
+## Loads resume metadata state from disk, or returns null if missing or invalid.
+pub function load_resume_meta(file_path: string)
+    let mp: string = meta_path_for(file_path)
+    if file_exists(mp) == false
+        return null
+    end
+
+    let raw_content: string = read_file(mp)
+    let lines = split_str(raw_content, "\n")
+    let url: string = ""
+    let dest_path: string = ""
+    let total_bytes: int = -1
+    let transferred_bytes: int = 0
+    let etag: string = ""
+    let chunk_size: int = 65536
+    let created_at: int = 0
+
+    let i: int = 0
+    let count: int = len(lines)
+    while i < count
+        let line: string = trim(lines[i])
+        let eq_idx: int = find_index(line, "=")
+        if eq_idx > 0
+            let key = slice(line, 0, eq_idx)
+            let val = slice(line, eq_idx + 1, len(line))
+            when key
+                is "url"
+                    url = val
+                is "dest_path"
+                    dest_path = val
+                is "total_bytes"
+                    total_bytes = to_int(val)
+                is "transferred_bytes"
+                    transferred_bytes = to_int(val)
+                is "etag"
+                    etag = val
+                is "chunk_size"
+                    chunk_size = to_int(val)
+                is "created_at"
+                    created_at = to_int(val)
+            end
+        end
+        i += 1
+    end
+
+    if url == ""
+        return null
+    end
+
+    return ResumeMeta {
+        url: url,
+        dest_path: dest_path,
+        total_bytes: total_bytes,
+        transferred_bytes: transferred_bytes,
+        etag: etag,
+        chunk_size: chunk_size,
+        created_at: created_at
+    }
+end
+
+## Deletes the metadata state file after a transfer finishes or aborts.
+pub function clear_resume_meta(file_path: string) -> int
+    let mp: string = meta_path_for(file_path)
+    if file_exists(mp) == true
+        return remove_file(mp)
+    end
+    return 1
+end
+
+## Evaluates whether a file has valid state to resume from.
+pub function can_resume(file_path: string, expected_url: string, expected_total: int = -1) -> bool
+    let meta = load_resume_meta(file_path)
+    if meta is null
+        return false
+    end
+    if meta.url != expected_url
+        return false
+    end
+    if expected_total > 0 and meta.total_bytes > 0 and meta.total_bytes != expected_total
+        return false
+    end
+    if file_exists(file_path) == false
+        return false
+    end
+    return true
+end

@@ -1,163 +1,133 @@
-## Example usage and walkthrough for transfer
+## Runnable showcase and demonstration for transfer
 ## Part of the Alya Language package ecosystem (https://github.com/alya-lang)
 
 import "../src/lib.alya" as pkg
 
 function main()
-    say "=== transfer Package Showcase ==="
+    say "=== Alya transfer Package Showcase ==="
     say ""
 
     # ───────────────────────────────────────────────────────────
-    # 1. Basic Facade Greeting
+    # 1. Fluent TransferBuilder Construction
     # ───────────────────────────────────────────────────────────
-    say "--- 1. Facade Greeting ---"
-    let greeting_default = pkg::hello()
-    say "Default: " + greeting_default
+    say "--- 1. Fluent TransferBuilder ---"
+    let dl = pkg::download("https://speed.hetzner.de/100MB.bin", "100MB.bin")
+    .timeout(20000)
+    .chunk_size(65536)
+    .rate_limit(5242880) # 5 MB/s
+    .resumable(1)
+    .auth("user", "token_xyz")
+    .header("User-Agent", "Custom-Alya-Agent/1.0")
+    .verify_sha256("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824")
 
-    let greeting_custom = pkg::hello("Alya Developer")
-    say "Custom:  " + greeting_custom
+    say "Download target URL:  " + dl.url
+    say "Destination path:     " + dl.file_path
+    say "Timeout setting:      " + str(dl.config.timeout_ms) + " ms"
+    say "Chunk buffer:         " + pkg::format_size(dl.config.chunk_size)
+    say "Bandwidth limit:      " + pkg::format_speed(dl.config.rate_limit_bps)
+    say "Summary:              " + dl.config.summary()
     say ""
 
     # ───────────────────────────────────────────────────────────
-    # 2. Enumeration Values
+    # 2. Progress Tracking & Visual Bar Rendering
     # ───────────────────────────────────────────────────────────
-    say "--- 2. Enumeration Values ---"
-    say "TransferStatus.Pending  = " + str(pkg::TransferStatus.Pending)
-    say "TransferStatus.Active   = " + str(pkg::TransferStatus.Active)
-    say "TransferStatus.Archived = " + str(pkg::TransferStatus.Archived)
-    say "TransferStatus.Error    = " + str(pkg::TransferStatus.Error)
+    say "--- 2. Live Progress Tracking & Visual Bar ---"
+    let prog1 = pkg::new_progress(1048576, 10485760, 524288) # 10%
+    let prog2 = pkg::new_progress(5242880, 10485760, 1048576) # 50%
+    let prog3 = pkg::new_progress(10485760, 10485760, 2097152) # 100%
 
-    say "TransferPriority.Low      = " + str(pkg::TransferPriority.Low)
-    say "TransferPriority.Normal   = " + str(pkg::TransferPriority.Normal)
-    say "TransferPriority.High     = " + str(pkg::TransferPriority.High)
-    say "TransferPriority.Critical = " + str(pkg::TransferPriority.Critical)
-
-    say "TransferStyle.Standard = " + str(pkg::TransferStyle.Standard)
-    say "TransferStyle.Formal   = " + str(pkg::TransferStyle.Formal)
-    say "TransferStyle.Casual   = " + str(pkg::TransferStyle.Casual)
+    say "10% Progress:  " + pkg::format_progress(prog1)
+    say "50% Progress:  " + pkg::format_progress(prog2)
+    say "100% Progress: " + pkg::format_progress(prog3)
+    say "Formatted byte sizes: 512 B, " + pkg::format_size(1572864) + ", " + pkg::format_size(5368709120)
+    say "Formatted duration:   " + pkg::format_time(125) + ", " + pkg::format_time(3670)
     say ""
 
     # ───────────────────────────────────────────────────────────
-    # 3. Struct Models & Constructors
+    # 3. HTTP Range Requests & Content-Range Headers
     # ───────────────────────────────────────────────────────────
-    say "--- 3. Struct Models & Constructors ---"
-    let cfg = pkg::new_config("Community", 5, pkg::TransferPriority.High, pkg::TransferStyle.Formal)
-    say "Config Name:     " + cfg.name
-    say "Config Count:    " + str(cfg.count)
-    say "Config Priority: " + str(cfg.priority)
-    say "Config Style:    " + str(cfg.style)
-    say "Config Enabled:  " + str(cfg.enabled)
+    say "--- 3. HTTP Range Header Processing ---"
+    let open_range = pkg::build_range_header(1048576)
+    let closed_range = pkg::build_range_header(0, 4095)
+    say "Open-ended range:   " + open_range
+    say "Closed byte range:  " + closed_range
 
-    let stats = pkg::make_stats(100, 92, 6, 2)
-    say "Stats Total:     " + str(stats.total)
-    say "Stats Passed:    " + str(stats.passed)
-    say "Stats Failed:    " + str(stats.failed)
-    say "Stats Skipped:   " + str(stats.skipped)
-    say "Stats Checked:   " + str(stats.total_checked())
-    say "Stats Rate:      " + stats.success_rate()
+    let cr = pkg::parse_content_range("bytes 1048576-2097151/10485760")
+    say "Content-Range valid: " + str(cr["valid"])
+    say "Range Start:         " + str(cr["start"])
+    say "Range End:           " + str(cr["end"])
+    say "Total File Size:     " + pkg::format_size(cr["total"])
     say ""
 
     # ───────────────────────────────────────────────────────────
-    # 4. Struct Methods & Immutability
+    # 4. Multi-Protocol URL Parsing
     # ───────────────────────────────────────────────────────────
-    say "--- 4. Struct Methods & Immutability ---"
-    say "Summary:         " + cfg.summary()
-    say "Description:     " + cfg.describe()
-    say "Is Valid:        " + str(cfg.is_valid())
-    say "Is Enabled:      " + str(cfg.is_enabled())
-
-    let updated_cfg = cfg.with_name("Core Contributors")
-    say "Updated Name:    " + updated_cfg.name
-    say "Original Name:   " + cfg.name
-
-    let critical_cfg = cfg.with_priority(pkg::TransferPriority.Critical)
-    say "Updated Prio:    " + str(critical_cfg.priority)
+    say "--- 4. Multi-Protocol URL Parsing ---"
+    let ftp_url = pkg::parse_transfer_url("ftp://operator:secret@ftp.server.org:2121/backups/db.tar.gz")
+    say "FTP Scheme:   " + ftp_url["scheme"]
+    say "FTP Host:     " + ftp_url["host"]
+    say "FTP Port:     " + str(ftp_url["port"])
+    say "FTP User:     " + ftp_url["user"]
+    say "FTP Path:     " + ftp_url["path"]
+    say "Filename:     " + pkg::extract_url_filename(ftp_url["path"])
     say ""
 
     # ───────────────────────────────────────────────────────────
-    # 5. Result Container Pattern
+    # 5. Cryptographic & Data Integrity Checksums
     # ───────────────────────────────────────────────────────────
-    say "--- 5. Result Container Pattern ---"
-    let ok_res = pkg::ok_result(42, "Processed payload successfully")
-    say "Ok Result is_ok:    " + str(ok_res.is_ok())
-    say "Ok Result message:  " + ok_res.message
-    say "Ok Result unwrap:   " + ok_res.unwrap_or("fallback")
+    say "--- 5. Data Integrity Checksums ---"
+    let sample = "The quick brown fox jumps over the lazy dog"
+    let crc = pkg::crc32(sample)
+    let md5_hash = pkg::md5(sample)
+    let sha_hash = pkg::sha256(sample)
 
-    let err_res = pkg::error_result("Processing failed", ["Disk full", "Permission denied"])
-    say "Err Result is_err:  " + str(err_res.is_error())
-    say "Err Result message: " + err_res.message
-    say "Err Result unwrap:  " + err_res.unwrap_or("safe default")
-    say "Err Count:          " + str(len(err_res.errors))
+    say "CRC-32:  " + crc
+    say "MD5:     " + md5_hash
+    say "SHA-256: " + sha_hash
     say ""
 
     # ───────────────────────────────────────────────────────────
-    # 6. Structural Duck Typing (Interfaces)
+    # 6. RFC 959 FTP Passive Mode Decoding
     # ───────────────────────────────────────────────────────────
-    say "--- 6. Duck Typing (Interfaces) ---"
-    if cfg is pkg::Summarizable
-        say "Summarizable dispatch: " + pkg::format_summary(cfg)
-    end
-    if cfg is pkg::Describable
-        say "Describable dispatch:  " + pkg::format_description(cfg)
-    end
+    say "--- 6. FTP Passive Mode (PASV) Decoding ---"
+    let pasv_line = "227 Entering Passive Mode (192,168,1,100,195,149)"
+    let pasv = pkg::ftp_parse_pasv(pasv_line)
+    say "PASV Raw:   " + pasv_line
+    say "Data IP:    " + pasv["ip"]
+    say "Data Port:  " + str(pasv["port"])
+    say "Command:    " + trim(pkg::ftp_format_command("RETR", "/files/doc.pdf"))
     say ""
 
     # ───────────────────────────────────────────────────────────
-    # 7. Workflow Processing & Batching
+    # 7. SFTP Binary Packet Framing (v3)
     # ───────────────────────────────────────────────────────────
-    say "--- 7. Workflow Processing & Batching ---"
-    let single_res = pkg::process("Analytics", 3, pkg::TransferPriority.High)
-    say "Single Process Result: " + pkg::format_result(single_res)
-
-    let items = ["Alpha", "Beta", "Gamma"]
-    let batch_res = pkg::process_batch(items)
-    say "Batch count: " + str(len(batch_res))
-    for b in batch_res
-        say "  - " + b
-    end
+    say "--- 7. SFTP Binary Packet Framing ---"
+    let open_pkt = pkg::sftp_build_open(1, "/var/log/syslog", pkg::SftpOpenFlags.Read)
+    say "SFTP Packet Type: " + str(open_pkt.packet_type)
+    say "SFTP Request ID:  " + str(open_pkt.request_id)
+    say "SFTP Wire Bytes:  " + str(len(open_pkt.payload_bytes)) + " bytes"
     say ""
 
     # ───────────────────────────────────────────────────────────
-    # 8. Control Flow & Pattern Matching Utilities
+    # 8. Feature-Gated Multipart Chunk Planning
     # ───────────────────────────────────────────────────────────
-    say "--- 8. Utility Functions ---"
-    say "Clamp (-5 in [0, 100]):  " + str(pkg::clamp(-5, 0, 100))
-    say "Clamp (50 in [0, 100]):  " + str(pkg::clamp(50, 0, 100))
-    say "Clamp (150 in [0, 100]): " + str(pkg::clamp(150, 0, 100))
-
-    say "Pluralize (1):           " + pkg::pluralize(1, "item", "items")
-    say "Pluralize (5):           " + pkg::pluralize(5, "item", "items")
-
-    let repeated = pkg::repeat_string("echo", 3)
-    say "Repeat string count:     " + str(len(repeated))
-    say ""
-
-    # ───────────────────────────────────────────────────────────
-    # 9. Destructuring: Tuples & Maps
-    # ───────────────────────────────────────────────────────────
-    say "--- 9. Destructuring ---"
-    let (label, count) = ("example", 42)
-    say "Tuple label: " + label
-    say "Tuple count: " + str(count)
-
-    let info = { "package": "transfer", "version": "0.1.0" }
-    let { package: pkg_name, version: pkg_ver } = info
-    say "Map package: " + pkg_name
-    say "Map version: " + pkg_ver
-    say ""
-
-    # ───────────────────────────────────────────────────────────
-    # 10. Feature-Gated API (`extras`, default-on)
-    # ───────────────────────────────────────────────────────────
-    say "--- 10. Feature-Gated Extras ---"
+    say "--- 8. Feature-Gated Extras ---"
     @cfg(feature = "extras")
-    say "Extras greeting: " + pkg::extra_greeting("Developer")
+    let banner = pkg::format_transfer_banner("Multipart Transfer Engine")
+    say banner
+    let chunks = pkg::plan_multipart_chunks(1000000, 4)
+    say "Planned 4 chunks for 1,000,000 bytes:"
+    let ci = 0
+    while ci < len(chunks)
+        let ch = chunks[ci]
+        say "  Chunk " + str(ch["index"]) + ": offset " + str(ch["start"]) + " .. " + str(ch["end"]) + " (" + pkg::format_size(ch["size"]) + ")"
+        ci += 1
+    end
     @cfg(not(feature = "extras"))
-    say "Extras greeting: (disabled — rebuild with --features extras)"
-    say ""
+    say "(Extras feature disabled)"
 
     say ""
-    say "Done!"
+    say "=== transfer Demo Completed Successfully ==="
 end
 
 main()
