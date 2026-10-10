@@ -3,6 +3,25 @@
 
 import "../src/lib.alya" as pkg
 
+@cfg(feature = "extras")
+function demo_extras()
+    let banner = pkg::format_transfer_banner("Multipart Transfer Engine")
+    say banner
+    let chunks = pkg::plan_multipart_chunks(1000000, 4)
+    say "Planned 4 chunks for 1,000,000 bytes:"
+    let ci = 0
+    while ci < len(chunks)
+        let ch = chunks[ci]
+        say "  Chunk " + str(ch["index"]) + ": offset " + str(ch["start"]) + " .. " + str(ch["end"]) + " (" + pkg::format_size(ch["size"]) + ")"
+        ci += 1
+    end
+end
+
+@cfg(not(feature = "extras"))
+function demo_extras()
+    say "(Extras feature disabled)"
+end
+
 function main()
     say "=== Alya transfer Package Showcase ==="
     say ""
@@ -112,19 +131,7 @@ function main()
     # 8. Feature-Gated Multipart Chunk Planning
     # ───────────────────────────────────────────────────────────
     say "--- 8. Feature-Gated Extras ---"
-    @cfg(feature = "extras")
-    let banner = pkg::format_transfer_banner("Multipart Transfer Engine")
-    say banner
-    let chunks = pkg::plan_multipart_chunks(1000000, 4)
-    say "Planned 4 chunks for 1,000,000 bytes:"
-    let ci = 0
-    while ci < len(chunks)
-        let ch = chunks[ci]
-        say "  Chunk " + str(ch["index"]) + ": offset " + str(ch["start"]) + " .. " + str(ch["end"]) + " (" + pkg::format_size(ch["size"]) + ")"
-        ci += 1
-    end
-    @cfg(not(feature = "extras"))
-    say "(Extras feature disabled)"
+    demo_extras()
 
     say ""
     say "=== transfer Demo Completed Successfully ==="

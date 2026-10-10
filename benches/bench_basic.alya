@@ -66,6 +66,13 @@ function main()
     bench_stop(runner, "ftp_parse_pasv 50k calls")
 
     # Bench 7: Multipart Chunk Planning — 20k iterations
+    bench_extras_chunk_planning(runner)
+
+    bench_summary(runner)
+end
+
+@cfg(feature = "extras")
+function bench_extras_chunk_planning(runner)
     bench_start(runner, 20000)
     let r = 0
     while r < 20000
@@ -73,8 +80,10 @@ function main()
         r += 1
     end
     bench_stop(runner, "plan_multipart_chunks 20k calls")
+end
 
-    bench_summary(runner)
+@cfg(not(feature = "extras"))
+function bench_extras_chunk_planning(runner)
 end
 
 main()
