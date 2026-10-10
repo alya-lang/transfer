@@ -33,15 +33,15 @@ pub function format_progress(prog: TransferProgress) -> string
     if prog.total_bytes > 0
         tot_str = format_size(prog.total_bytes)
     end
-    return "{bar} {bytes_str}/{tot_str} ({spd})"
+    return f"{bar} {bytes_str}/{tot_str} ({spd})"
 end
 
 ## Formats a `TransferResult` into an outcome string.
 pub function format_result(result: TransferResult) -> string
     if result.is_ok() == true
-        return "[OK] Transferred {format_size(result.bytes_transferred)} to '{result.file_path}'"
+        return f"[OK] Transferred {format_size(result.bytes_transferred)} to '{result.file_path}'"
     end
-    return "[ERROR] Transfer failed for '{result.file_path}': {result.error_message}"
+    return f"[ERROR] Transfer failed for '{result.file_path}': {result.error_message}"
 end
 
 ## Formats a `TransferConfig` into a summary string.

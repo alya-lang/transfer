@@ -263,12 +263,12 @@ pub function TransferConfig.summary(self: TransferConfig) -> string
         is 1 => "resumable"
         else => "non-resumable"
     end
-    return "TransferConfig(timeout={self.timeout_ms}ms, chunk={self.chunk_size}B, {res_str})"
+    return f"TransferConfig(timeout={self.timeout_ms}ms, chunk={self.chunk_size}B, {res_str})"
 end
 
 ## Returns a detailed multi-attribute description of this configuration.
 pub function TransferConfig.describe(self: TransferConfig) -> string
-    return "[TransferConfig] timeout={self.timeout_ms}ms, chunk_size={self.chunk_size}, retries={self.max_retries}, rate_limit={self.rate_limit_bps}bps"
+    return f"[TransferConfig] timeout={self.timeout_ms}ms, chunk_size={self.chunk_size}, retries={self.max_retries}, rate_limit={self.rate_limit_bps}bps"
 end
 
 ## Validates whether this configuration conforms to essential operational constraints.
@@ -385,7 +385,7 @@ end
 
 ## Formats the live progress into a human-readable summary.
 pub function TransferProgress.summary(self: TransferProgress) -> string
-    return "{self.percent}% ({self.bytes_transferred}/{self.total_bytes} bytes)"
+    return f"{self.percent}% ({self.bytes_transferred}/{self.total_bytes} bytes)"
 end
 
 ## Returns 1 if the progress indicates full completion.
@@ -449,9 +449,9 @@ end
 ## Returns a formatted single-line string summary of this result.
 pub function TransferResult.summary(self: TransferResult) -> string
     if self.success == 1
-        return "TransferResult(OK, path='{self.file_path}', bytes={self.bytes_transferred}, elapsed={self.elapsed_ms}ms)"
+        return f"TransferResult(OK, path='{self.file_path}', bytes={self.bytes_transferred}, elapsed={self.elapsed_ms}ms)"
     end
-    return "TransferResult(FAILED, path='{self.file_path}', error='{self.error_message}')"
+    return f"TransferResult(FAILED, path='{self.file_path}', error='{self.error_message}')"
 end
 
 # ───────────────────────────────────────────────────────────────
@@ -505,5 +505,5 @@ end
 
 ## Returns a formatted summary of this SFTP packet.
 pub function SftpPacket.summary(self: SftpPacket) -> string
-    return "SftpPacket(type={self.packet_type}, id={self.request_id}, len={len(self.payload)})"
+    return f"SftpPacket(type={self.packet_type}, id={self.request_id}, len={len(self.payload)})"
 end
