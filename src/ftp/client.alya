@@ -247,7 +247,7 @@ pub function ftp_download_file(host: string, port: int, user: string, pass: stri
     let last: TransferResult = error_result(local_path, "No attempts made")
     while attempt < attempts
         last = ftp_download_once(host, port, user, pass, remote_path, local_path, use_cfg, on_progress)
-        if last.is_ok() == 1
+        if last.is_ok() == true
             return last
         end
         if ftp_retryable_error(last.error_message) == 0
@@ -451,7 +451,7 @@ pub function ftp_upload_file(host: string, port: int, user: string, pass: string
             force_fresh = 1
         end
         last = ftp_upload_once(host, port, user, pass, local_path, remote_path, use_cfg, on_progress, force_fresh)
-        if last.is_ok() == 1
+        if last.is_ok() == true
             return last
         end
         if ftp_retryable_error(last.error_message) == 0
@@ -599,7 +599,7 @@ pub function ftps_upgrade_socket(sock: int, host: string, port: int, cfg: Transf
     if cfg.tls_verify == 0
         tcfg = tcfg.with_verify(tls::TlsVerifyMode.None)
     end
-    if tcfg.is_valid() == 0
+    if tcfg.is_valid() == false
         res["error"] = "Invalid FTPS endpoint " + host + ":" + str(port)
         return res
     end
@@ -906,7 +906,7 @@ pub function ftps_download_file(host: string, port: int, user: string, pass: str
     let last: TransferResult = error_result(local_path, "No attempts made")
     while attempt < attempts
         last = ftps_download_once(host, port, user, pass, remote_path, local_path, use_cfg, on_progress)
-        if last.is_ok() == 1
+        if last.is_ok() == true
             return last
         end
         if ftp_retryable_error(last.error_message) == 0
@@ -1035,7 +1035,7 @@ pub function ftps_upload_file(host: string, port: int, user: string, pass: strin
             force_fresh = 1
         end
         last = ftps_upload_once(host, port, user, pass, local_path, remote_path, use_cfg, on_progress, force_fresh)
-        if last.is_ok() == 1
+        if last.is_ok() == true
             return last
         end
         if ftp_retryable_error(last.error_message) == 0
