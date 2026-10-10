@@ -86,6 +86,13 @@ alya add transfer --git https://github.com/alya-lang/transfer --branch main
 alya install
 ```
 
+### Package Features
+
+| Feature | Default | Description |
+|:---|:---:|:---|
+| `extras` | ✅ | Multipart chunk planners and transfer banners (`plan_multipart_chunks`, `format_transfer_banner`). |
+| `secure` | ❌ | TLS-backed HTTPS/FTPS transfers; enables the `tls` dependency (`https_download_once`, `ftps_*`). |
+
 ### 🔒 HTTPS & FTPS (`secure` feature)
 
 TLS transports live behind the opt-in `secure` feature (pulls the `tls` package, which needs a C toolchain). The default build stays dependency-free:
