@@ -12,6 +12,7 @@ import "../types.alya"
 import "../core/str_util.alya"
 import "../core/progress.alya"
 import "../core/throttle.alya"
+import "../core/binary.alya"
 import "./protocol.alya"
 
 @cfg(feature = "secure")
@@ -238,6 +239,9 @@ pub function ftp_download_file(host: string, port: int, user: string, pass: stri
     if use_cfg.ftps == 1
         return ftps_download_file(host, port, user, pass, remote_path, local_path, use_cfg, on_progress)
     end
+    if use_cfg.binary == 1 and use_cfg.checksum_algo != ChecksumAlgo.None
+        return error_result(local_path, "Checksum verification requires text mode (binary = 0)")
+    end
     let attempts: int = retry_max_attempts(use_cfg)
     let attempt: int = 0
     let last: TransferResult = error_result(local_path, "No attempts made")
@@ -372,22 +376,38 @@ pub function ftp_download_once(host: string, port: int, user: string, pass: stri
 
     let receiving: int = 1
     while receiving == 1
-        let chunk: string = net::tcp_recv(data_sock, read_size)
-        let clen: int = len(chunk)
-        if clen == 0
-            receiving = 0
-            break
+        if cfg.binary == 1
+            let piece = net::tcp_recv_bytes(data_sock, read_size)
+            let plen: int = len(piece)
+            if plen == 0
+                receiving = 0
+                break
+            end
+            append_bytes(local_path, piece)
+            transferred += plen
+            if on_progress is not null
+                let prog = progress_update(tracker, transferred, clock_ms())
+                on_progress(prog)
+            end
+            throttle_wait(throttle, plen)
+        else
+            let chunk: string = net::tcp_recv(data_sock, read_size)
+            let clen: int = len(chunk)
+            if clen == 0
+                receiving = 0
+                break
+            end
+
+            append_file(local_path, chunk)
+            transferred += clen
+
+            if on_progress is not null
+                let prog = progress_update(tracker, transferred, clock_ms())
+                on_progress(prog)
+            end
+
+            throttle_wait(throttle, clen)
         end
-
-        append_file(local_path, chunk)
-        transferred += clen
-
-        if on_progress is not null
-            let prog = progress_update(tracker, transferred, clock_ms())
-            on_progress(prog)
-        end
-
-        throttle_wait(throttle, clen)
     end
 
     net::tcp_close(data_sock)
@@ -878,6 +898,9 @@ pub function ftps_download_file(host: string, port: int, user: string, pass: str
     if use_cfg is null
         use_cfg = make_config()
     end
+    if use_cfg.binary == 1 and use_cfg.checksum_algo != ChecksumAlgo.None
+        return error_result(local_path, "Checksum verification requires text mode (binary = 0)")
+    end
     let attempts: int = retry_max_attempts(use_cfg)
     let attempt: int = 0
     let last: TransferResult = error_result(local_path, "No attempts made")
@@ -962,6 +985,17 @@ pub function ftps_download_once(host: string, port: int, user: string, pass: str
         if piece is null or len(piece) == 0
             receiving = 0
             break
+        end
+        if cfg.binary == 1
+            # TLS payload size is server-determined: always write the full chunk.
+            append_bytes(local_path, piece)
+            transferred += len(piece)
+            if on_progress is not null
+                let prog = progress_update(tracker, transferred, clock_ms())
+                on_progress(prog)
+            end
+            throttle_wait(throttle, len(piece))
+            continue
         end
         # TLS payload size is server-determined: always write the full chunk.
         let chunk: string = https_bytes_to_str(piece)

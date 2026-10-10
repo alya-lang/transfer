@@ -81,7 +81,8 @@ pub struct TransferConfig
     ftps: int,
     tls_verify: int,
     ftp_active_ip: string,
-    ftp_active_port: int
+    ftp_active_port: int,
+    binary: int
 end
 
 ## Live progress metric reported during an active transfer.
@@ -145,7 +146,7 @@ end
 # ───────────────────────────────────────────────────────────────
 
 ## Creates a new default `TransferConfig` instance.
-pub function make_config(timeout_ms: int = 15000, chunk_size: int = 65536, max_retries: int = 3, retry_delay_ms: int = 1000, rate_limit_bps: int = 0, resumable: int = 1, overwrite: int = 0, ftp_mode: int = 0, ftps: int = 0, tls_verify: int = 1, ftp_active_ip: string = "", ftp_active_port: int = 0) -> TransferConfig
+pub function make_config(timeout_ms: int = 15000, chunk_size: int = 65536, max_retries: int = 3, retry_delay_ms: int = 1000, rate_limit_bps: int = 0, resumable: int = 1, overwrite: int = 0, ftp_mode: int = 0, ftps: int = 0, tls_verify: int = 1, ftp_active_ip: string = "", ftp_active_port: int = 0, binary: int = 0) -> TransferConfig
     let limit: int = rate_limit_bps
     if limit < 0
         limit = 0
@@ -161,6 +162,10 @@ pub function make_config(timeout_ms: int = 15000, chunk_size: int = 65536, max_r
     let verify: int = tls_verify
     if verify != 0 and verify != 1
         verify = 1
+    end
+    let bin: int = binary
+    if bin != 0 and bin != 1
+        bin = 0
     end
     return TransferConfig {
         timeout_ms: timeout_ms,
@@ -179,7 +184,8 @@ pub function make_config(timeout_ms: int = 15000, chunk_size: int = 65536, max_r
         ftps: secure_ftp,
         tls_verify: verify,
         ftp_active_ip: ftp_active_ip,
-        ftp_active_port: ftp_active_port
+        ftp_active_port: ftp_active_port,
+        binary: bin
     }
 end
 
@@ -285,6 +291,9 @@ pub function TransferConfig.is_valid(self: TransferConfig) -> int
     if self.tls_verify != 0 and self.tls_verify != 1
         return 0
     end
+    if self.binary != 0 and self.binary != 1
+        return 0
+    end
     return 1
 end
 
@@ -333,6 +342,20 @@ pub function TransferConfig.set_ftp_active(self: TransferConfig, ip: string, por
     self.ftp_mode = 1
     self.ftp_active_ip = ip
     self.ftp_active_port = port
+    return self
+end
+
+## Enables (1) or disables (0) binary mode (byte-exact body handling).
+##
+## Binary mode is required for non-text payloads: body bytes bypass strings
+## entirely (write_bytes/append_bytes). Checksum verification is not
+## available in binary mode (hash engines are string-based).
+pub function TransferConfig.set_binary(self: TransferConfig, enabled: int) -> TransferConfig
+    if enabled == 1
+        self.binary = 1
+    else
+        self.binary = 0
+    end
     return self
 end
 

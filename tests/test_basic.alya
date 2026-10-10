@@ -3,6 +3,7 @@
 
 import "std/test"
 import "std/net" as net
+import "std/sync" as sync
 import "../src/lib.alya" as pkg
 
 # ───────────────────────────────────────────────────────────
@@ -102,6 +103,20 @@ function t_fake_recv()
     let p = t_resps[t_cursor["resp"]]
     t_cursor["resp"] = t_cursor["resp"] + 1
     return p
+end
+
+# Single-shot binary HTTP server on a background thread (no shared state:
+# everything travels in `arg`). Serves one `body` array per accept; the
+# listening socket stays open for reuse across scenarios.
+function t_bin_server(arg)
+    let acc: int = net::tcp_accept(arg["listen"])
+    if acc < 0
+        return
+    end
+    net::tcp_recv(acc, 4096)
+    net::tcp_send(acc, "HTTP/1.1 200 OK\r\nContent-Length: " + str(len(arg["body"])) + "\r\nConnection: close\r\n\r\n")
+    net::tcp_send_bytes(acc, arg["body"])
+    net::tcp_close(acc)
 end
 
 function main()
@@ -552,6 +567,82 @@ function main()
     .tls_verify(0)
     runner_assert_eq(r, adv_builder.config.ftp_mode, 1, "builder ftp_active sets mode")
     runner_assert_eq(r, adv_builder.config.tls_verify, 0, "builder tls_verify sets flag")
+
+    # ═══════════════════════════════════════════════════════════
+    # 20. Binary Helpers & Binary-Mode Config
+    # ═══════════════════════════════════════════════════════════
+    runner_assert_eq(r, pkg::bytes_find_header_end([65, 13, 10, 13, 10, 66]), 1, "header end at 1")
+    runner_assert_eq(r, pkg::bytes_find_header_end([65, 66]), -1, "no header end")
+    let rng = pkg::bytes_range([10, 20, 30, 40], 1, 3)
+    runner_assert_eq(r, len(rng), 2, "bytes_range length")
+    runner_assert_eq(r, rng[0], 20, "bytes_range first")
+    runner_assert_eq(r, rng[1], 30, "bytes_range second")
+    let hd = pkg::bytes_head_text([72, 84, 84, 80], 4)
+    runner_assert_eq(r, hd["ok"], 1, "ascii head decodes")
+    runner_assert_str_eq(r, hd["text"], "HTTP", "head text matches")
+    let bad_hd = pkg::bytes_head_text([65, 0, 66], 3)
+    runner_assert_eq(r, bad_hd["ok"], 0, "NUL head rejected")
+
+    let bin_cfg = pkg::new_config(5000, 8, 0, 0, 1)
+    runner_assert_eq(r, bin_cfg.binary, 0, "binary defaults to off")
+    bin_cfg.set_binary(1)
+    runner_assert_eq(r, bin_cfg.binary, 1, "set_binary enables")
+    runner_assert_eq(r, bin_cfg.is_valid(), 1, "binary cfg is valid")
+    let bin_builder = pkg::download("http://h/f.bin", "f.bin").binary()
+    runner_assert_eq(r, bin_builder.config.binary, 1, "builder binary() enables")
+
+    let chk_cfg = pkg::new_config(5000, 1024, 0, 0, 1)
+    chk_cfg.set_binary(1)
+    chk_cfg.set_checksum(pkg::ChecksumAlgo.Sha256, "abc")
+    let chk_res = pkg::http_transfer_download("http://127.0.0.1:1/x", "temp_bin_chk.bin", chk_cfg, null)
+    runner_assert_eq(r, chk_res.is_error(), 1, "binary+checksum is rejected")
+
+    # ═══════════════════════════════════════════════════════════
+    # 21. Binary HTTP Download Over Loopback (NUL-safe)
+    # ═══════════════════════════════════════════════════════════
+    let bin_body = [0, 1, 2, 250, 0, 255, 72, 0, 100, 200, 33, 0]
+    let bin_port: int = 39551
+    let bin_ls: int = -1
+    while bin_port < 39554
+        bin_ls = net::tcp_listen(bin_port)
+        if bin_ls >= 0
+            break
+        end
+        bin_port += 1
+    end
+    if bin_ls >= 0
+        let srv = sync::sync_spawn(t_bin_server, { "listen": bin_ls, "body": bin_body })
+        if srv >= 0
+            let bin_dl = "temp_bin_dl.bin"
+            let bin_res = pkg::http_download_once("http://127.0.0.1:" + str(bin_port) + "/f.bin", bin_dl, bin_cfg, null)
+            sync::sync_join(srv)
+            runner_assert_eq(r, bin_res.is_ok(), 1, "binary loopback download ok")
+            let got = read_bytes(bin_dl)
+            runner_assert_eq(r, len(got), len(bin_body), "binary length matches")
+            let match_all: int = 1
+            let bi: int = 0
+            while bi < len(bin_body)
+                if got[bi] != bin_body[bi]
+                    match_all = 0
+                end
+                bi += 1
+            end
+            runner_assert_eq(r, match_all, 1, "binary bytes match incl NULs")
+            remove_file(bin_dl)
+
+            # Resume path: server ignores Range (200) so the engine restarts.
+            write_bytes(bin_dl, [0, 1, 2, 250])
+            let srv2 = sync::sync_spawn(t_bin_server, { "listen": bin_ls, "body": bin_body })
+            if srv2 >= 0
+                let bin_re = pkg::http_download_once("http://127.0.0.1:" + str(bin_port) + "/f.bin", bin_dl, bin_cfg, null)
+                sync::sync_join(srv2)
+                runner_assert_eq(r, bin_re.is_ok(), 1, "binary resume download ok")
+                runner_assert_eq(r, len(read_bytes(bin_dl)), len(bin_body), "resumed binary length matches")
+            end
+            remove_file(bin_dl)
+        end
+        net::tcp_close(bin_ls)
+    end
 
     let failed = runner_summary(r)
     if failed > 0

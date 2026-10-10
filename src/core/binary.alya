@@ -1,0 +1,84 @@
+## Binary Body Helpers
+##
+## Part of the Alya Language package ecosystem (https://github.com/alya-lang).
+## Byte-array utilities for binary transfer mode: header/body splitting
+## without ever routing body bytes through strings (strings cannot hold
+## NUL bytes), plus ASCII-only header decoding.
+
+## Copies `arr[lo:hi]` into a new array (clamped, no aliasing).
+pub function bytes_range(arr, lo: int, hi: int) -> array
+    let out = []
+    if arr is null
+        return out
+    end
+    let a: int = lo
+    if a < 0
+        a = 0
+    end
+    let b: int = hi
+    if b > len(arr)
+        b = len(arr)
+    end
+    let i: int = a
+    while i < b
+        out.push(arr[i])
+        i += 1
+    end
+    return out
+end
+
+## Appends all of `src` onto `dst` (both byte arrays), returns `dst`.
+pub function bytes_append_all(dst, src) -> array
+    if src is null
+        return dst
+    end
+    let i: int = 0
+    while i < len(src)
+        dst.push(src[i])
+        i += 1
+    end
+    return dst
+end
+
+## Finds the first `\r\n\r\n` in a byte array, returns its index or -1.
+pub function bytes_find_header_end(data) -> int
+    if data is null or len(data) < 4
+        return -1
+    end
+    let i: int = 0
+    let last: int = len(data) - 4
+    while i <= last
+        if data[i] == 13 and data[i + 1] == 10 and data[i + 2] == 13 and data[i + 3] == 10
+            return i
+        end
+        i += 1
+    end
+    return -1
+end
+
+## Decodes header bytes to text. Result map: ok/text.
+##
+## Headers must be printable ASCII plus CR/LF/TAB; anything else (NUL,
+## high bytes) is rejected with ok = 0 instead of throwing.
+pub function bytes_head_text(data, stop: int) -> map
+    let res = { "ok": 0, "text": "" }
+    if data is null or stop < 0 or stop > len(data)
+        return res
+    end
+    let text: string = ""
+    let i: int = 0
+    while i < stop
+        let b: int = data[i]
+        if b == 9 or b == 10 or b == 13
+            text += chr(b)
+        elif b >= 32 and b <= 126
+            text += chr(b)
+        else
+            return res
+        end
+        i += 1
+    end
+    res["ok"] = 1
+    res["text"] = text
+    return res
+end

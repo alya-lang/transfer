@@ -16,6 +16,7 @@ Multi-protocol file transfer toolkit for Alya: HTTP range, resumable downloads a
 - 🔁 **Retry with Backoff**: Configurable `max_retries` / `retry_delay_ms` around every engine; only retryable failures (connection drops, timeouts, HTTP 5xx, transient FTP 4xx, truncation) are retried
 - ➡️ **Redirect Following**: Downloads follow up to 5 same- or cross-protocol redirects (auth headers stripped across hosts, query strings preserved); uploads reject redirects with the `Location`
 - ⚡ **Bandwidth Throttling**: Token-bucket rate limiter enforcing configurable transfer speeds (`rate_limit_bps`) on downloads and uploads, HTTP and FTP
+- 📦 **Binary Mode**: Byte-exact downloads (`.binary(1)`) for non-text payloads via the new `write_bytes` / `append_bytes` / `read_bytes` builtins; checksum verification needs text mode, uploads and SFTP stay text-only for now
 - 🔒 **Integrity & Checksums**: Built-in CRC-32 (IEEE 802.3), MD5 (RFC 1321), and SHA-256 (FIPS 180-4) verification engines
 - 📊 **Real-Time Progress Metrics**: Granular speed (B/s, KB/s, MB/s), ETA calculation, and visual ASCII progress bar rendering
 - 🛠️ **Fluent Builder API**: Ergonomic `TransferBuilder` chaining timeouts, chunk sizes, custom HTTP headers, basic auth, and progress callbacks
@@ -163,6 +164,7 @@ main()
 | `retry_max_attempts(config)` / `retry_backoff_ms(config, attempt)` | `pub function` | Attempt budget (`max_retries + 1`) and linear backoff delay. |
 | `ftp_format_port(ip, port)` | `pub function` | Builds a PORT argument for FTP active mode. |
 | `throttle_wait(throttle, chunk_size)` | `pub function` | Accounts a chunk and sleeps when the rate cap is exceeded. |
+| `write_bytes(path, data)` / `append_bytes(path, data)` / `read_bytes(path)` | builtins | Byte-exact file I/O preserving embedded NULs (binary mode needs them). |
 | `new_config(timeout_ms, chunk_size, max_retries, rate_limit_bps, resumable)` | `pub function` | Factory constructing a `TransferConfig` with sensible defaults. |
 | `new_progress(bytes_transferred, total_bytes, speed_bps)` | `pub function` | Factory constructing a `TransferProgress` snapshot. |
 | `crc32(data)` | `pub function` | Computes the CRC-32 IEEE 802.3 checksum string of data. |
@@ -172,7 +174,7 @@ main()
 | `plan_multipart_chunks(total_bytes, chunk_count)` | `pub function` (`extras` feature) | Partitions byte ranges for parallel multi-part transfers. |
 | `format_transfer_banner(title)` | `pub function` (`extras` feature) | Renders formatted ASCII banner for CLI transfer tools. |
 | `TransferBuilder` | `pub struct` | Fluent builder with chained configuration setters and `execute()`. |
-| `TransferConfig` | `pub struct` | Configuration parameters (`timeout_ms`, `chunk_size`, `rate_limit_bps`, `resumable`, `max_retries`, `retry_delay_ms`, `ftp_mode`, `ftps`, `tls_verify`, etc.). |
+| `TransferConfig` | `pub struct` | Configuration parameters (`timeout_ms`, `chunk_size`, `rate_limit_bps`, `resumable`, `max_retries`, `retry_delay_ms`, `ftp_mode`, `ftps`, `tls_verify`, `binary`, etc.). |
 | `TransferProgress` | `pub struct` | Real-time transfer metrics with `render_bar()`, `summary()`, and `is_complete()`. |
 | `TransferResult` | `pub struct` | Operation outcome with `is_ok()`, `is_error()`, and `summary()`. |
 | `ResumeMeta` | `pub struct` | Persistent resume metadata token (`.transfer_meta`) container. |

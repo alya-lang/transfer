@@ -81,8 +81,8 @@ end
 # ───────────────────────────────────────────────────────────────
 
 ## Creates a default `TransferConfig` instance.
-pub function new_config(timeout_ms: int = 15000, chunk_size: int = 65536, max_retries: int = 3, rate_limit_bps: int = 0, resumable: int = 1, ftp_mode: int = 0, ftps: int = 0, tls_verify: int = 1) -> TransferConfig
-    return make_config(timeout_ms, chunk_size, max_retries, 1000, rate_limit_bps, resumable, 0, ftp_mode, ftps, tls_verify)
+pub function new_config(timeout_ms: int = 15000, chunk_size: int = 65536, max_retries: int = 3, rate_limit_bps: int = 0, resumable: int = 1, ftp_mode: int = 0, ftps: int = 0, tls_verify: int = 1, binary: int = 0) -> TransferConfig
+    return make_config(timeout_ms, chunk_size, max_retries, 1000, rate_limit_bps, resumable, 0, ftp_mode, ftps, tls_verify, "", 0, binary)
 end
 
 ## Creates a default `TransferProgress` metric record.

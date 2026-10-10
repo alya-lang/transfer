@@ -14,6 +14,7 @@ import "../core/checksum.alya"
 import "../core/progress.alya"
 import "../core/throttle.alya"
 import "../core/resume.alya"
+import "../core/binary.alya"
 import "./range.alya"
 
 @cfg(feature = "secure")
@@ -196,11 +197,15 @@ end
 ## Follows up to `max_hops` redirects (auth headers are stripped when the
 ## host changes) and retries retryable failures per `max_retries` with
 ## linear backoff (`retry_delay_ms`). HTTPS hops require the `secure`
-## feature.
+## feature. With `binary = 1` the body bypasses strings entirely
+## (byte-exact, NUL-safe); checksum verification needs text mode.
 pub function http_transfer_download(url_str: string, dest_path: string, config: TransferConfig = null, on_progress = null, max_hops: int = 5) -> TransferResult
     let cfg: TransferConfig = config
     if cfg is null
         cfg = make_config()
+    end
+    if cfg.binary == 1 and cfg.checksum_algo != ChecksumAlgo.None
+        return error_result(dest_path, "Checksum verification requires text mode (binary = 0)")
     end
     let attempts: int = retry_max_attempts(cfg)
     let attempt: int = 0
@@ -303,22 +308,47 @@ pub function http_download_once(url_str: string, dest_path: string, cfg: Transfe
         let req_wire: string = build_http_request("GET", host, target, req_headers)
         net::tcp_send(sock, req_wire)
 
-        # Read response headers until \r\n\r\n
+        # Read response headers until \r\n\r\n (bytes path stays NUL-safe:
+        # only the ASCII head is ever decoded to a string).
         let header_buf: string = ""
         let body_remainder: string = ""
+        let head_raw = []
+        let body_raw = []
         let in_headers: int = 1
 
-        while in_headers == 1
-            let chunk: string = net::tcp_recv(sock, 2048)
-            if chunk == ""
-                break
+        if cfg.binary == 1
+            while in_headers == 1
+                let piece = net::tcp_recv_bytes(sock, 2048)
+                if len(piece) == 0
+                    break
+                end
+                bytes_append_all(head_raw, piece)
+                let sep: int = bytes_find_header_end(head_raw)
+                if sep >= 0
+                    body_raw = bytes_range(head_raw, sep + 4, len(head_raw))
+                    head_raw = bytes_range(head_raw, 0, sep)
+                    in_headers = 0
+                end
             end
-            header_buf += chunk
-            let sep: int = find_index(header_buf, "\r\n\r\n")
-            if sep >= 0
-                body_remainder = slice(header_buf, sep + 4, len(header_buf))
-                header_buf = slice(header_buf, 0, sep)
-                in_headers = 0
+            let head_dec = bytes_head_text(head_raw, len(head_raw))
+            if head_dec["ok"] == 0
+                net::tcp_close(sock)
+                return error_result(dest_path, "Non-ASCII response headers from " + host + ":" + str(port), 0, clock_ms() - op_start_ms)
+            end
+            header_buf = head_dec["text"]
+        else
+            while in_headers == 1
+                let chunk: string = net::tcp_recv(sock, 2048)
+                if chunk == ""
+                    break
+                end
+                header_buf += chunk
+                let sep: int = find_index(header_buf, "\r\n\r\n")
+                if sep >= 0
+                    body_remainder = slice(header_buf, sep + 4, len(header_buf))
+                    header_buf = slice(header_buf, 0, sep)
+                    in_headers = 0
+                end
             end
         end
 
@@ -354,6 +384,12 @@ pub function http_download_once(url_str: string, dest_path: string, cfg: Transfe
 
         if status_code < 200 or status_code >= 400
             net::tcp_close(sock)
+            # 416 with a resume offset means the partial file already holds the
+            # whole object (e.g. re-running against a completed download).
+            if status_code == 416 and start_offset > 0
+                clear_resume_meta(dest_path)
+                return ok_result(dest_path, start_offset, start_offset, "", clock_ms() - op_start_ms)
+            end
             return error_result(dest_path, "HTTP error " + str(status_code) + " " + parsed_resp["status_text"], 0, clock_ms() - op_start_ms)
         end
 
@@ -384,7 +420,21 @@ pub function http_download_once(url_str: string, dest_path: string, cfg: Transfe
 
         # Write initial body remainder if any
         let transferred: int = start_offset
-        if len(body_remainder) > 0
+        if cfg.binary == 1
+            if len(body_raw) > 0
+                if is_resumed == 1
+                    append_bytes(dest_path, body_raw)
+                else
+                    write_bytes(dest_path, body_raw)
+                end
+                transferred += len(body_raw)
+                throttle_wait(throttle, len(body_raw))
+                if on_progress is not null
+                    let init_prog = progress_update(tracker, transferred, clock_ms())
+                    on_progress(init_prog)
+                end
+            end
+        elif len(body_remainder) > 0
             if is_resumed == 1
                 append_file(dest_path, body_remainder)
             else
@@ -407,28 +457,46 @@ pub function http_download_once(url_str: string, dest_path: string, cfg: Transfe
 
         let active: int = 1
         while active == 1
-            let chunk: string = net::tcp_recv(sock, read_chunk_size)
-            let clen: int = len(chunk)
-            if clen == 0
-                active = 0
-                break
+            if cfg.binary == 1
+                let piece = net::tcp_recv_bytes(sock, read_chunk_size)
+                let plen: int = len(piece)
+                if plen == 0
+                    active = 0
+                    break
+                end
+                append_bytes(dest_path, piece)
+                transferred += plen
+                meta.transferred_bytes = transferred
+                save_resume_meta(meta)
+                if on_progress is not null
+                    let prog = progress_update(tracker, transferred, clock_ms())
+                    on_progress(prog)
+                end
+                throttle_wait(throttle, plen)
+            else
+                let chunk: string = net::tcp_recv(sock, read_chunk_size)
+                let clen: int = len(chunk)
+                if clen == 0
+                    active = 0
+                    break
+                end
+
+                append_file(dest_path, chunk)
+                transferred += clen
+
+                # Update metadata token
+                meta.transferred_bytes = transferred
+                save_resume_meta(meta)
+
+                # Dispatch live progress callback
+                if on_progress is not null
+                    let prog = progress_update(tracker, transferred, clock_ms())
+                    on_progress(prog)
+                end
+
+                # Apply rate limiting throttle if configured (sleeps when over budget)
+                throttle_wait(throttle, clen)
             end
-
-            append_file(dest_path, chunk)
-            transferred += clen
-
-            # Update metadata token
-            meta.transferred_bytes = transferred
-            save_resume_meta(meta)
-
-            # Dispatch live progress callback
-            if on_progress is not null
-                let prog = progress_update(tracker, transferred, clock_ms())
-                on_progress(prog)
-            end
-
-            # Apply rate limiting throttle if configured (sleeps when over budget)
-            throttle_wait(throttle, clen)
 
             if total_bytes > 0 and transferred >= total_bytes
                 active = 0
@@ -719,6 +787,9 @@ pub function https_transfer_download(url_str: string, dest_path: string, config:
     if cfg is null
         cfg = make_config()
     end
+    if cfg.binary == 1 and cfg.checksum_algo != ChecksumAlgo.None
+        return error_result(dest_path, "Checksum verification requires text mode (binary = 0)")
+    end
     let attempts: int = retry_max_attempts(cfg)
     let attempt: int = 0
     let last: TransferResult = error_result(dest_path, "No attempts made")
@@ -814,25 +885,50 @@ pub function https_download_once(url_str: string, dest_path: string, cfg: Transf
             return error_result(dest_path, "TLS send failed to " + host + ":" + str(port), 0, clock_ms() - op_start_ms)
         end
 
-        # Read response headers until \r\n\r\n
+        # Read response headers until \r\n\r\n (bytes path stays NUL-safe)
         let header_buf: string = ""
         let body_remainder: string = ""
+        let head_raw = []
+        let body_raw = []
         let in_headers: int = 1
         let guard: int = 0
 
-        while in_headers == 1 and guard < 512
-            let chunk: string = https_tls_recv(full)
-            if chunk == ""
-                break
+        if cfg.binary == 1
+            while in_headers == 1 and guard < 512
+                let piece = tls::tls_recv_encrypted(full)
+                if piece is null or len(piece) == 0
+                    break
+                end
+                bytes_append_all(head_raw, piece)
+                let sep: int = bytes_find_header_end(head_raw)
+                if sep >= 0
+                    body_raw = bytes_range(head_raw, sep + 4, len(head_raw))
+                    head_raw = bytes_range(head_raw, 0, sep)
+                    in_headers = 0
+                end
+                guard += 1
             end
-            header_buf += chunk
-            let sep: int = find_index(header_buf, "\r\n\r\n")
-            if sep >= 0
-                body_remainder = slice(header_buf, sep + 4, len(header_buf))
-                header_buf = slice(header_buf, 0, sep)
-                in_headers = 0
+            let head_dec = bytes_head_text(head_raw, len(head_raw))
+            if head_dec["ok"] == 0
+                https_close_session(full)
+                return error_result(dest_path, "Non-ASCII response headers from " + host + ":" + str(port), 0, clock_ms() - op_start_ms)
             end
-            guard += 1
+            header_buf = head_dec["text"]
+        else
+            while in_headers == 1 and guard < 512
+                let chunk: string = https_tls_recv(full)
+                if chunk == ""
+                    break
+                end
+                header_buf += chunk
+                let sep: int = find_index(header_buf, "\r\n\r\n")
+                if sep >= 0
+                    body_remainder = slice(header_buf, sep + 4, len(header_buf))
+                    header_buf = slice(header_buf, 0, sep)
+                    in_headers = 0
+                end
+                guard += 1
+            end
         end
 
         let parsed_resp = parse_http_header_block(header_buf)
@@ -867,6 +963,12 @@ pub function https_download_once(url_str: string, dest_path: string, cfg: Transf
 
         if status_code < 200 or status_code >= 400
             https_close_session(full)
+            # 416 with a resume offset means the partial file already holds the
+            # whole object (e.g. re-running against a completed download).
+            if status_code == 416 and start_offset > 0
+                clear_resume_meta(dest_path)
+                return ok_result(dest_path, start_offset, start_offset, "", clock_ms() - op_start_ms)
+            end
             return error_result(dest_path, "HTTP error " + str(status_code) + " " + parsed_resp["status_text"], 0, clock_ms() - op_start_ms)
         end
 
@@ -897,7 +999,21 @@ pub function https_download_once(url_str: string, dest_path: string, cfg: Transf
 
         # Write initial body remainder if any
         let transferred: int = start_offset
-        if len(body_remainder) > 0
+        if cfg.binary == 1
+            if len(body_raw) > 0
+                if is_resumed == 1
+                    append_bytes(dest_path, body_raw)
+                else
+                    write_bytes(dest_path, body_raw)
+                end
+                transferred += len(body_raw)
+                throttle_wait(throttle, len(body_raw))
+                if on_progress is not null
+                    let init_prog = progress_update(tracker, transferred, clock_ms())
+                    on_progress(init_prog)
+                end
+            end
+        elif len(body_remainder) > 0
             if is_resumed == 1
                 append_file(dest_path, body_remainder)
             else
@@ -914,25 +1030,42 @@ pub function https_download_once(url_str: string, dest_path: string, cfg: Transf
         # Stream remaining data chunks from the TLS session
         let active: int = 1
         while active == 1
-            let chunk: string = https_tls_recv(full)
-            let clen: int = len(chunk)
-            if clen == 0
-                active = 0
-                break
+            if cfg.binary == 1
+                let piece = tls::tls_recv_encrypted(full)
+                if piece is null or len(piece) == 0
+                    active = 0
+                    break
+                end
+                append_bytes(dest_path, piece)
+                transferred += len(piece)
+                meta.transferred_bytes = transferred
+                save_resume_meta(meta)
+                if on_progress is not null
+                    let prog = progress_update(tracker, transferred, clock_ms())
+                    on_progress(prog)
+                end
+                throttle_wait(throttle, len(piece))
+            else
+                let chunk: string = https_tls_recv(full)
+                let clen: int = len(chunk)
+                if clen == 0
+                    active = 0
+                    break
+                end
+
+                append_file(dest_path, chunk)
+                transferred += clen
+
+                meta.transferred_bytes = transferred
+                save_resume_meta(meta)
+
+                if on_progress is not null
+                    let prog = progress_update(tracker, transferred, clock_ms())
+                    on_progress(prog)
+                end
+
+                throttle_wait(throttle, clen)
             end
-
-            append_file(dest_path, chunk)
-            transferred += clen
-
-            meta.transferred_bytes = transferred
-            save_resume_meta(meta)
-
-            if on_progress is not null
-                let prog = progress_update(tracker, transferred, clock_ms())
-                on_progress(prog)
-            end
-
-            throttle_wait(throttle, clen)
 
             if total_bytes > 0 and transferred >= total_bytes
                 active = 0

@@ -156,6 +156,16 @@ pub function TransferBuilder.ftp_active(self: TransferBuilder, ip: string, port:
     return self
 end
 
+## Enables (1) or disables (0) binary mode (byte-exact body handling).
+pub function TransferBuilder.binary(self: TransferBuilder, enabled: int = 1) -> TransferBuilder
+    if enabled == 1
+        self.config.binary = 1
+    else
+        self.config.binary = 0
+    end
+    return self
+end
+
 ## Executes the configured transfer job and returns the final `TransferResult`.
 pub function TransferBuilder.execute(self: TransferBuilder) -> TransferResult
     let parsed = parse_transfer_url(self.url)

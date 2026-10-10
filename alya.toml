@@ -1,7 +1,7 @@
 [package]
 name = "transfer"
 version = "0.1.0"
-alya-version = "0.0.19"
+alya-version = "0.0.20"
 entry = "src/lib.alya"
 description = "Multi-protocol file transfer toolkit for Alya: HTTP range, resumable downloads and uploads, FTP, SFTP framing, throttling and checksums"
 authors = ["Alya Language Contributors <https://github.com/alya-lang>"]
