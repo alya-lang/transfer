@@ -223,7 +223,7 @@ function main()
     let saved = pkg::save_resume_meta(meta)
     runner_assert_eq(r, saved != 0, true, "save_resume_meta succeeds")
 
-    let loaded = pkg::load_resume_meta(test_file)
+    let loaded: pkg::ResumeMeta = pkg::load_resume_meta(test_file)
     runner_assert_eq(r, loaded is not null, true, "load_resume_meta returns non-null")
     runner_assert_str_eq(r, loaded.url, "http://example.com/file.bin", "loaded meta url matches")
     runner_assert_eq(r, loaded.total_bytes, 100, "loaded meta total_bytes is 100")
